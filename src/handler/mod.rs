@@ -437,7 +437,7 @@ impl Handler {
             if let Some(session) = self.sessions.get_mut(&node_address) {
                 // Encrypt the message and send
                 session
-                    .encrypt_message(self.node_id, &request.clone().encode())
+                    .encrypt_message(self.node_id, &request.encode())
                     .map_err(|e| RequestError::EncryptionFailed(format!("{:?}", e)))?
             } else {
                 // No session exists, start a new handshake
@@ -512,7 +512,7 @@ impl Handler {
         let enr_seq = remote_enr.clone().map_or_else(|| 0, |enr| enr.seq());
         let id_nonce: IdNonce = rand::random();
         let packet = Packet::new_whoareyou(message_nonce, id_nonce, enr_seq);
-        let challenge_data = ChallengeData::try_from(packet.authenticated_data().as_slice())
+        let challenge_data = ChallengeData::try_from(&packet.authenticated_data()[..])
             .expect("Must be the correct challenge size");
         debug!("Sending WHOAREYOU to {}", node_address);
         self.send(node_address.clone(), packet).await;
@@ -613,7 +613,7 @@ impl Handler {
             updated_enr,
             &self.node_id,
             &challenge_data,
-            &(request_call.request.clone().encode()),
+            &(request_call.request.encode()),
         ) {
             Ok(v) => v,
             Err(e) => {

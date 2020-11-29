@@ -3,6 +3,7 @@ use crate::{
     node_info::NodeContact,
     packet::{ChallengeData, Packet, PacketHeader, PacketKind, MESSAGE_NONCE_LENGTH},
 };
+use bytes::BytesMut;
 use enr::{CombinedKey, NodeId};
 use zeroize::Zeroize;
 
@@ -238,8 +239,9 @@ impl Session {
 
         // Create the authenticated data for the new packet.
 
-        let mut authenticated_data = packet.iv.to_be_bytes().to_vec();
-        authenticated_data.extend_from_slice(&packet.header.encode());
+        let mut authenticated_data = BytesMut::new();
+        authenticated_data.extend_from_slice(&packet.iv.to_be_bytes());
+        packet.header.write(&mut authenticated_data);
 
         // encrypt the message
         let message_ciphertext =

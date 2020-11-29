@@ -1,3 +1,4 @@
+use bytes::{BufMut, BytesMut};
 use enr::{CombinedKey, Enr};
 use rlp::{DecoderError, RlpStream};
 use std::net::IpAddr;
@@ -134,57 +135,55 @@ impl Request {
     }
 
     /// Encodes a Message to RLP-encoded bytes.
-    pub fn encode(self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(10);
+    pub(crate) fn encode(&self) -> BytesMut {
+        let mut out = BytesMut::new();
+        self.write(&mut out);
+        out
+    }
+
+    /// Encodes a Message to RLP-encoded bytes.
+    pub fn write(&self, buf: &mut BytesMut) {
+        buf.reserve(10);
         let msg_type = self.msg_type();
-        buf.push(msg_type);
+        buf.put_u8(msg_type);
         let id = &self.id;
-        match self.body {
+        let mut s = RlpStream::new_with_buffer(buf.split_off(buf.len()));
+        match &self.body {
             RequestBody::Ping { enr_seq } => {
-                let mut s = RlpStream::new();
                 s.begin_list(2);
                 s.append(&id.as_bytes());
-                s.append(&enr_seq);
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(enr_seq);
+                buf.unsplit(s.out());
             }
             RequestBody::FindNode { distances } => {
-                let mut s = RlpStream::new();
                 s.begin_list(2);
                 s.append(&id.as_bytes());
                 s.begin_list(distances.len());
                 for distance in distances {
-                    s.append(&distance);
+                    s.append(distance);
                 }
-                buf.extend_from_slice(&s.drain());
-                buf
+                buf.unsplit(s.out());
             }
             RequestBody::Talk { protocol, request } => {
-                let mut s = RlpStream::new();
                 s.begin_list(3);
                 s.append(&id.as_bytes());
-                s.append(&protocol);
-                s.append(&request);
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(protocol);
+                s.append(request);
+                buf.unsplit(s.out());
             }
             RequestBody::RegisterTopic { topic, enr, ticket } => {
-                let mut s = RlpStream::new();
                 s.begin_list(4);
                 s.append(&id.as_bytes());
-                s.append(&topic);
-                s.append(&enr);
-                s.append(&ticket);
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(topic);
+                s.append(enr);
+                s.append(ticket);
+                buf.unsplit(s.out());
             }
             RequestBody::TopicQuery { topic } => {
-                let mut s = RlpStream::new();
                 s.begin_list(2);
                 s.append(&id.as_bytes());
-                s.append(&(&topic as &[u8]));
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(&(topic as &[u8]));
+                buf.unsplit(s.out());
             }
         }
     }
@@ -217,66 +216,63 @@ impl Response {
     }
 
     /// Encodes a Message to RLP-encoded bytes.
-    pub fn encode(self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(10);
+    pub(crate) fn encode(&self) -> BytesMut {
+        let mut out = BytesMut::new();
+        self.write(&mut out);
+        out
+    }
+
+    pub fn write(&self, buf: &mut BytesMut) {
+        buf.reserve(10);
         let msg_type = self.msg_type();
-        buf.push(msg_type);
+        buf.put_u8(msg_type);
         let id = &self.id;
-        match self.body {
+        let mut s = RlpStream::new_with_buffer(buf.split_off(buf.len()));
+        match &self.body {
             ResponseBody::Pong { enr_seq, ip, port } => {
-                let mut s = RlpStream::new();
                 s.begin_list(4);
                 s.append(&id.as_bytes());
-                s.append(&enr_seq);
+                s.append(enr_seq);
                 match ip {
                     IpAddr::V4(addr) => s.append(&(&addr.octets() as &[u8])),
                     IpAddr::V6(addr) => s.append(&(&addr.octets() as &[u8])),
                 };
-                s.append(&port);
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(port);
+                buf.unsplit(s.out());
             }
             ResponseBody::Nodes { total, nodes } => {
-                let mut s = RlpStream::new();
                 s.begin_list(3);
                 s.append(&id.as_bytes());
-                s.append(&total);
+                s.append(total);
 
                 if nodes.is_empty() {
                     s.begin_list(0);
                 } else {
                     s.begin_list(nodes.len());
                     for node in nodes {
-                        s.append(&node);
+                        s.append(node);
                     }
                 }
-                buf.extend_from_slice(&s.drain());
-                buf
+                buf.unsplit(s.out());
             }
             ResponseBody::Talk { response } => {
-                let mut s = RlpStream::new();
                 s.begin_list(2);
                 s.append(&id.as_bytes());
-                s.append(&response);
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(response);
+                buf.unsplit(s.out());
             }
             ResponseBody::Ticket { ticket, wait_time } => {
-                let mut s = RlpStream::new();
                 s.begin_list(3);
                 s.append(&id.as_bytes());
-                s.append(&ticket);
-                s.append(&wait_time);
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(&ticket.as_slice());
+                s.append(wait_time);
+                buf.unsplit(s.out());
             }
             ResponseBody::RegisterConfirmation { topic } => {
-                let mut s = RlpStream::new();
                 s.begin_list(2);
                 s.append(&id.as_bytes());
-                s.append(&topic);
-                buf.extend_from_slice(&s.drain());
-                buf
+                s.append(topic);
+                buf.unsplit(s.out());
             }
         }
     }
@@ -370,10 +366,16 @@ impl std::fmt::Display for RequestBody {
 }
 #[allow(dead_code)]
 impl Message {
-    pub fn encode(self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> BytesMut {
+        let mut out = BytesMut::new();
+        self.write(&mut out);
+        out
+    }
+
+    pub fn write(&self, buf: &mut BytesMut) {
         match self {
-            Self::Request(request) => request.encode(),
-            Self::Response(response) => response.encode(),
+            Self::Request(request) => request.write(buf),
+            Self::Response(response) => response.write(buf),
         }
     }
 
@@ -619,7 +621,7 @@ mod tests {
         // expected hex output
         let expected_output = hex::decode("01c20101").unwrap();
 
-        dbg!(hex::encode(message.clone().encode()));
+        dbg!(hex::encode(&message.encode()));
         assert_eq!(message.encode(), expected_output);
     }
 
@@ -635,7 +637,7 @@ mod tests {
 
         // expected hex output
         let expected_output = hex::decode("03c501c3820100").unwrap();
-        dbg!(hex::encode(message.clone().encode()));
+        dbg!(hex::encode(message.encode()));
 
         assert_eq!(message.encode(), expected_output);
     }
@@ -655,7 +657,7 @@ mod tests {
         // expected hex output
         let expected_output = hex::decode("02ca0101847f000001821388").unwrap();
 
-        dbg!(hex::encode(message.clone().encode()));
+        dbg!(hex::encode(message.encode()));
         assert_eq!(message.encode(), expected_output);
     }
 
@@ -695,7 +697,7 @@ mod tests {
                 nodes: vec![enr],
             },
         });
-        dbg!(hex::encode(message.clone().encode()));
+        dbg!(hex::encode(message.encode()));
         assert_eq!(message.encode(), expected_output);
     }
 
@@ -718,7 +720,7 @@ mod tests {
                 nodes: vec![enr, enr2],
             },
         });
-        dbg!(hex::encode(message.clone().encode()));
+        dbg!(hex::encode(message.encode()));
         assert_eq!(message.encode(), expected_output);
     }
 
@@ -752,7 +754,7 @@ mod tests {
             body: RequestBody::Ping { enr_seq: 15 },
         });
 
-        let encoded = request.clone().encode();
+        let encoded = request.encode();
         let decoded = Message::decode(&encoded).unwrap();
 
         assert_eq!(request, decoded);
@@ -770,7 +772,7 @@ mod tests {
             },
         });
 
-        let encoded = request.clone().encode();
+        let encoded = request.encode();
         let decoded = Message::decode(&encoded).unwrap();
 
         assert_eq!(request, decoded);
@@ -786,7 +788,7 @@ mod tests {
             },
         });
 
-        let encoded = request.clone().encode();
+        let encoded = request.encode();
         let decoded = Message::decode(&encoded).unwrap();
 
         assert_eq!(request, decoded);
@@ -820,7 +822,7 @@ mod tests {
             },
         });
 
-        let encoded = request.clone().encode();
+        let encoded = request.encode();
         let decoded = Message::decode(&encoded).unwrap();
 
         assert_eq!(request, decoded);
@@ -837,7 +839,7 @@ mod tests {
             },
         });
 
-        let encoded = request.clone().encode();
+        let encoded = request.encode();
         let decoded = Message::decode(&encoded).unwrap();
 
         assert_eq!(request, decoded);

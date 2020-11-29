@@ -14,6 +14,7 @@ use aes_ctr::{
     cipher::{generic_array::GenericArray, NewStreamCipher, SyncStreamCipher},
     Aes128Ctr,
 };
+use bytes::BytesMut;
 use enr::NodeId;
 use rand::Rng;
 use std::convert::TryInto;
@@ -92,9 +93,15 @@ pub struct PacketHeader {
 
 impl PacketHeader {
     // Encodes the header to bytes to be included into the `masked-header` of the Packet Encoding.
-    pub fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> BytesMut {
+        let mut out = BytesMut::new();
+        self.write(&mut out);
+        out
+    }
+
+    pub fn write(&self, buf: &mut BytesMut) {
         let auth_data = self.kind.encode();
-        let mut buf = Vec::with_capacity(auth_data.len() + STATIC_HEADER_LENGTH);
+        buf.reserve(auth_data.len() + STATIC_HEADER_LENGTH);
         buf.extend_from_slice(PROTOCOL_ID.as_bytes());
         buf.extend_from_slice(&VERSION.to_be_bytes());
         let kind: u8 = (&self.kind).into();
@@ -102,7 +109,6 @@ impl PacketHeader {
         buf.extend_from_slice(&self.message_nonce);
         buf.extend_from_slice(&(auth_data.len() as u16).to_be_bytes());
         buf.extend_from_slice(&auth_data);
-        buf
     }
 }
 
@@ -144,16 +150,23 @@ impl Into<u8> for &PacketKind {
 }
 
 impl PacketKind {
+    pub(crate) fn encode(&self) -> BytesMut {
+        let mut out = BytesMut::new();
+        self.write(&mut out);
+        out
+    }
+
     /// Encodes the packet type into its corresponding auth_data.
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn write(&self, auth_data: &mut BytesMut) {
         match self {
-            PacketKind::Message { src_id } => src_id.raw().to_vec(),
+            PacketKind::Message { src_id } => {
+                auth_data.extend_from_slice(&src_id.raw());
+            }
             PacketKind::WhoAreYou { id_nonce, enr_seq } => {
-                let mut auth_data = Vec::with_capacity(24);
+                auth_data.reserve(24);
                 auth_data.extend_from_slice(id_nonce);
                 auth_data.extend_from_slice(&enr_seq.to_be_bytes());
                 debug_assert_eq!(auth_data.len(), 24);
-                auth_data
             }
             PacketKind::Handshake {
                 src_id,
@@ -169,7 +182,7 @@ impl PacketKind {
                     + pubkey_size
                     + node_record.as_ref().map(|x| x.len()).unwrap_or_default();
 
-                let mut auth_data = Vec::with_capacity(expected_len);
+                auth_data.reserve(expected_len);
                 auth_data.extend_from_slice(&src_id.raw());
                 auth_data.extend_from_slice(&(sig_size as u8).to_be_bytes());
                 auth_data.extend_from_slice(&(pubkey_size as u8).to_be_bytes());
@@ -179,7 +192,6 @@ impl PacketKind {
                     auth_data.extend_from_slice(&node_record);
                 }
                 debug_assert_eq!(auth_data.len(), expected_len);
-                auth_data
             }
         }
     }
@@ -372,24 +384,30 @@ impl Packet {
     }
 
     /// Generates the authenticated data for this packet.
-    pub fn authenticated_data(&self) -> Vec<u8> {
-        let mut authenticated_data = self.iv.to_be_bytes().to_vec();
-        authenticated_data.extend_from_slice(&self.header.encode());
+    pub fn authenticated_data(&self) -> BytesMut {
+        let mut authenticated_data = BytesMut::new();
+        authenticated_data.extend_from_slice(&self.iv.to_be_bytes());
+        self.header.write(&mut authenticated_data);
         authenticated_data
     }
 
     /// Encodes a packet to bytes and performs the AES-CTR encryption.
-    pub fn encode(self, dst_id: &NodeId) -> Vec<u8> {
+    pub(crate) fn encode(&self, dst_id: &NodeId) -> BytesMut {
+        let mut out = BytesMut::new();
+        self.write(&mut out, dst_id);
+        out
+    }
+
+    pub fn write(&self, buf: &mut BytesMut, dst_id: &NodeId) {
         let header = self.encrypt_header(dst_id);
-        let mut buf = Vec::with_capacity(IV_LENGTH + header.len() + self.message.len());
+        buf.reserve(IV_LENGTH + header.len() + self.message.len());
         buf.extend_from_slice(&self.iv.to_be_bytes());
         buf.extend_from_slice(&header);
         buf.extend_from_slice(&self.message);
-        buf
     }
 
     /// Creates the masked header of a packet performing the required AES-CTR encryption.
-    fn encrypt_header(&self, dst_id: &NodeId) -> Vec<u8> {
+    fn encrypt_header(&self, dst_id: &NodeId) -> BytesMut {
         let mut header_bytes = self.header.encode();
 
         /* Encryption is done inline
@@ -742,7 +760,7 @@ mod tests {
 
         let packet = Packet::new_random(&src_id).unwrap();
 
-        let encoded_packet = packet.clone().encode(&dst_id);
+        let encoded_packet = packet.encode(&dst_id);
         let (decoded_packet, _authenticated_data) =
             Packet::decode(&dst_id, &encoded_packet).unwrap();
 
@@ -759,7 +777,7 @@ mod tests {
 
         let packet = Packet::new_whoareyou(message_nonce, id_nonce, enr_seq);
 
-        let encoded_packet = packet.clone().encode(&dst_id);
+        let encoded_packet = packet.encode(&dst_id);
         let (decoded_packet, _authenticated_data) =
             Packet::decode(&dst_id, &encoded_packet).unwrap();
 
@@ -779,7 +797,7 @@ mod tests {
         let packet =
             Packet::new_authheader(src_id, message_nonce, id_nonce_sig, pubkey, enr_record);
 
-        let encoded_packet = packet.clone().encode(&dst_id);
+        let encoded_packet = packet.encode(&dst_id);
         let (decoded_packet, _authenticated_data) =
             Packet::decode(&dst_id, &encoded_packet).unwrap();
 

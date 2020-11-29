@@ -19,6 +19,7 @@ use crate::{
     service::{QueryKind, Service, ServiceRequest},
     Discv5Config, Enr,
 };
+use bytes::Bytes;
 use enr::{CombinedKey, EnrError, EnrKey, NodeId};
 use parking_lot::RwLock;
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
@@ -300,7 +301,7 @@ impl Discv5 {
     }
 
     /// Allows application layer to insert an arbitrary field into the local ENR.
-    pub fn enr_insert(&mut self, key: &str, value: &[u8]) -> Result<Option<Vec<u8>>, EnrError> {
+    pub fn enr_insert(&mut self, key: &str, value: &[u8]) -> Result<Option<Bytes>, EnrError> {
         self.local_enr
             .write()
             .insert(key, value, &self.enr_key.read())
