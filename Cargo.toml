@@ -15,7 +15,7 @@ exclude = [
 ]
 
 [dependencies]
-enr = { version = "0.5.0", features = ["k256", "ed25519"] }
+enr = { git = "https://github.com/rust-ethereum/enr", features = ["k256", "ed25519"] }
 tokio = { version = "1.1", features = ["net", "sync", "macros"] }
 tokio-stream = "0.1.2"
 tokio-util = { version = "0.6.2", features = ["time"] }
