@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
+    ProtocolIdentity,
     node_info::NodeContact,
-    packet::{ChallengeData, Packet, PacketHeader, PacketKind, MESSAGE_NONCE_LENGTH},
+    packet::{ChallengeData, MESSAGE_NONCE_LENGTH, Packet, PacketHeader, PacketKind},
 };
 use enr::{CombinedKey, NodeId};
 use zeroize::Zeroize;
@@ -19,9 +20,12 @@ pub(crate) struct Keys {
 pub(crate) struct Session {
     /// The current keys used to encrypt/decrypt messages.
     keys: Keys,
-    /// If a new handshake is being established, these keys can be tried to determine if this new
-    /// set of keys is canon.
-    awaiting_keys: Option<Keys>,
+    /// If a new handshake is being established, the older keys are maintained as race
+    /// conditions in the handshake can give different views of which keys are canon.
+    /// The key that worked to decrypt our last message (or are freshly established) exist in
+    /// `keys` and previous keys are optionally stored in `old_keys`. We attempt to decrypt
+    /// messages with `keys` before optionally trying `old_keys`.
+    old_keys: Option<Keys>,
     /// If we contacted this node without an ENR, i.e. via a multiaddr, during the session
     /// establishment we request the nodes ENR. Once the ENR is received and verified, this session
     /// becomes established.
@@ -37,7 +41,7 @@ impl Session {
     pub fn new(keys: Keys) -> Self {
         Session {
             keys,
-            awaiting_keys: None,
+            old_keys: None,
             awaiting_enr: None,
             counter: 0,
         }
@@ -45,8 +49,8 @@ impl Session {
 
     /// A new session has been established. Update this session based on the new session.
     pub fn update(&mut self, new_session: Session) {
-        // Await the new sessions keys
-        self.awaiting_keys = Some(new_session.keys);
+        // Optimistically assume the new keys are canonical.
+        self.old_keys = Some(std::mem::replace(&mut self.keys, new_session.keys));
         self.awaiting_enr = new_session.awaiting_enr;
     }
 
@@ -56,13 +60,14 @@ impl Session {
         &mut self,
         src_id: NodeId,
         message: &[u8],
-    ) -> Result<Packet, Discv5Error> {
+        protocol_identity: ProtocolIdentity,
+    ) -> Result<Packet, Error> {
         self.counter += 1;
 
         // If the message nonce length is ever set below 4 bytes this will explode. The packet
         // size constants shouldn't be modified.
         let random_nonce: [u8; MESSAGE_NONCE_LENGTH - 4] = rand::random();
-        let mut message_nonce: MessageNonce = [0u8; crate::packet::MESSAGE_NONCE_LENGTH];
+        let mut message_nonce: MessageNonce = [0u8; MESSAGE_NONCE_LENGTH];
         message_nonce[..4].copy_from_slice(&self.counter.to_be_bytes());
         message_nonce[4..].copy_from_slice(&random_nonce);
 
@@ -71,6 +76,7 @@ impl Session {
         let header = PacketHeader {
             message_nonce,
             kind: PacketKind::Message { src_id },
+            protocol_identity,
         };
 
         let mut authenticated_data = iv.to_be_bytes().to_vec();
@@ -99,18 +105,27 @@ impl Session {
         message_nonce: MessageNonce,
         message: &[u8],
         aad: &[u8],
-    ) -> Result<Vec<u8>, Discv5Error> {
-        // try with the new keys
-        if let Some(new_keys) = self.awaiting_keys.take() {
-            let result =
-                crypto::decrypt_message(&new_keys.decryption_key, message_nonce, message, aad);
-            if result.is_ok() {
-                self.keys = new_keys;
-                return result;
-            }
+    ) -> Result<Vec<u8>, Error> {
+        // First try with the canonical keys.
+        let result_canon =
+            crypto::decrypt_message(&self.keys.decryption_key, message_nonce, message, aad);
+
+        // If decryption is fine, nothing more to do.
+        if result_canon.is_ok() {
+            return result_canon;
         }
-        // if it failed try with the old keys
-        crypto::decrypt_message(&self.keys.decryption_key, message_nonce, message, aad)
+
+        // If these keys did not work, try old_keys
+        if let Some(old_keys) = self.old_keys.take() {
+            let result =
+                crypto::decrypt_message(&old_keys.decryption_key, message_nonce, message, aad);
+            if result.is_ok() {
+                // rotate the keys
+                self.old_keys = Some(std::mem::replace(&mut self.keys, old_keys));
+            }
+            return result;
+        }
+        result_canon
     }
 
     /* Session Helper Functions */
@@ -126,7 +141,7 @@ impl Session {
         id_nonce_sig: &[u8],
         ephem_pubkey: &[u8],
         enr_record: Option<Enr>,
-    ) -> Result<(Session, Enr), Discv5Error> {
+    ) -> Result<(Session, Enr), Error> {
         // check and verify a potential ENR update
 
         // Duplicate code here to avoid cloning an ENR
@@ -143,10 +158,10 @@ impl Session {
                 (None, Some(known_enr)) => known_enr,
                 (None, None) => {
                     warn!(
-                "Peer did not respond with their ENR. Session could not be established. Node: {}",
-                remote_id
-            );
-                    return Err(Discv5Error::SessionNotEstablished);
+                        node = %remote_id,
+                        "Peer did not respond with their ENR. Session could not be established",
+                    );
+                    return Err(Error::SessionNotEstablished);
                 }
             };
             enr.public_key()
@@ -157,10 +172,10 @@ impl Session {
             &remote_public_key,
             ephem_pubkey,
             &challenge.data,
-            &local_id,
+            local_id,
             id_nonce_sig,
         ) {
-            return Err(Discv5Error::InvalidChallengeSignature(challenge));
+            return Err(Error::InvalidChallengeSignature(Box::new(challenge)));
         }
 
         // The keys are derived after the message has been verified to prevent potential extra work
@@ -204,9 +219,10 @@ impl Session {
         local_key: Arc<RwLock<CombinedKey>>,
         updated_enr: Option<Enr>,
         local_node_id: &NodeId,
+        protocol_identity: ProtocolIdentity,
         challenge_data: &ChallengeData,
         message: &[u8],
-    ) -> Result<(Packet, Session), Discv5Error> {
+    ) -> Result<(Packet, Session), Error> {
         // generate the session keys
         let (encryption_key, decryption_key, ephem_pubkey) =
             crypto::generate_session_keys(local_node_id, remote_contact, challenge_data)?;
@@ -223,13 +239,14 @@ impl Session {
             &ephem_pubkey,
             &remote_contact.node_id(),
         )
-        .map_err(|_| Discv5Error::Custom("Could not sign WHOAREYOU nonce"))?;
+        .map_err(|_| Error::Custom("Could not sign WHOAREYOU nonce"))?;
 
         // build an authentication packet
         let message_nonce: MessageNonce = rand::random();
         let mut packet = Packet::new_authheader(
             *local_node_id,
             message_nonce,
+            protocol_identity,
             sig,
             ephem_pubkey,
             updated_enr,

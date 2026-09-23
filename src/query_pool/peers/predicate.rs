@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
-    config::Discv5Config,
-    kbucket::{Distance, Key, PredicateKey, MAX_NODES_PER_BUCKET},
+    config::Config,
+    kbucket::{Distance, Key, MAX_NODES_PER_BUCKET, PredicateKey},
 };
 use std::{
     collections::btree_map::{BTreeMap, Entry},
@@ -55,7 +55,7 @@ pub(crate) struct PredicateQueryConfig {
 }
 
 impl PredicateQueryConfig {
-    pub(crate) fn new_from_config(config: &Discv5Config) -> Self {
+    pub(crate) fn new_from_config(config: &Config) -> Self {
         Self {
             parallelism: config.query_parallelism,
             num_results: MAX_NODES_PER_BUCKET,
@@ -163,7 +163,7 @@ where
         // Incorporate the reported closer peers into the query.
         for result in closer_peers {
             // If ENR satisfies the predicate, add to list of peers that satisfies predicate
-            let predicate_match = (self.predicate)(&result);
+            let predicate_match = (self.predicate)(result);
             let key: TNodeId = result.into();
             let key: Key<TNodeId> = key.into();
             let distance = self.target_key.distance(&key);
@@ -214,12 +214,12 @@ where
         let key: Key<TNodeId> = peer.clone().into();
         let distance = key.distance(&self.target_key);
 
-        if let Entry::Occupied(mut e) = self.closest_peers.entry(distance) {
-            if let QueryPeerState::Waiting(..) = e.get().state {
-                debug_assert!(self.num_waiting > 0);
-                self.num_waiting -= 1;
-                e.get_mut().state = QueryPeerState::Failed
-            }
+        if let Entry::Occupied(mut e) = self.closest_peers.entry(distance)
+            && let QueryPeerState::Waiting(..) = e.get().state
+        {
+            debug_assert!(self.num_waiting > 0);
+            self.num_waiting -= 1;
+            e.get_mut().state = QueryPeerState::Failed
         }
     }
 
@@ -279,15 +279,15 @@ where
                 }
 
                 QueryPeerState::Succeeded => {
-                    if let Some(ref mut cnt) = result_counter {
-                        if peer.predicate_match {
-                            *cnt += 1;
-                            // If `num_results` successful results have been delivered for the
-                            // closest peers, the query is done.
-                            if *cnt >= self.config.num_results {
-                                self.progress = QueryProgress::Finished;
-                                return QueryState::Finished;
-                            }
+                    if let Some(ref mut cnt) = result_counter
+                        && peer.predicate_match
+                    {
+                        *cnt += 1;
+                        // If `num_results` successful results have been delivered for the
+                        // closest peers, the query is done.
+                        if *cnt >= self.config.num_results {
+                            self.progress = QueryProgress::Finished;
+                            return QueryState::Finished;
                         }
                     }
                 }
@@ -314,8 +314,8 @@ where
     /// Consumes the query, returning the peers who match the predicate.
     pub fn into_result(self) -> Vec<TNodeId> {
         self.closest_peers
-            .into_iter()
-            .filter_map(|(_, peer)| {
+            .into_values()
+            .filter_map(|peer| {
                 if let QueryPeerState::Succeeded = peer.state {
                     if peer.predicate_match {
                         Some(peer.key.into_preimage())

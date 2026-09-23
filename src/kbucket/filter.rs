@@ -38,7 +38,7 @@ const MAX_NODES_PER_SUBNET_TABLE: usize = 10;
 const MAX_NODES_PER_SUBNET_BUCKET: usize = 2;
 
 #[derive(Clone)]
-pub struct IpTableFilter;
+pub(crate) struct IpTableFilter;
 
 impl Filter<Enr> for IpTableFilter {
     fn filter(
@@ -51,7 +51,7 @@ impl Filter<Enr> for IpTableFilter {
 }
 
 #[derive(Clone)]
-pub struct IpBucketFilter;
+pub(crate) struct IpBucketFilter;
 
 impl Filter<Enr> for IpBucketFilter {
     fn filter(
@@ -72,7 +72,7 @@ fn ip_filter(
     other_vals: &mut dyn Iterator<Item = &Enr>,
     limit: usize,
 ) -> bool {
-    if let Some(ip) = value_to_be_inserted.ip() {
+    if let Some(ip) = value_to_be_inserted.ip4() {
         let mut count = 0;
         for enr in other_vals {
             // Ignore duplicates
@@ -81,10 +81,10 @@ fn ip_filter(
             }
 
             // Count the same /24 subnet
-            if let Some(other_ip) = enr.ip() {
-                if other_ip.octets()[0..3] == ip.octets()[0..3] {
-                    count += 1;
-                }
+            if let Some(other_ip) = enr.ip4()
+                && other_ip.octets()[0..3] == ip.octets()[0..3]
+            {
+                count += 1;
             }
             if count >= limit {
                 return false;

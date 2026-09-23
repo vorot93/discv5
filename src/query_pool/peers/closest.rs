@@ -23,7 +23,7 @@
 //
 use super::*;
 use crate::{
-    config::Discv5Config,
+    config::Config,
     kbucket::{Distance, Key, MAX_NODES_PER_BUCKET},
 };
 use std::{
@@ -76,7 +76,7 @@ pub struct FindNodeQueryConfig {
 }
 
 impl FindNodeQueryConfig {
-    pub fn new_from_config(config: &Discv5Config) -> Self {
+    pub fn new_from_config(config: &Config) -> Self {
         Self {
             parallelism: config.query_parallelism,
             num_results: MAX_NODES_PER_BUCKET,
@@ -324,8 +324,8 @@ where
     /// Consumes the query, returning the target and the closest peers.
     pub fn into_result(self) -> Vec<TNodeId> {
         self.closest_peers
-            .into_iter()
-            .filter_map(|(_, peer)| {
+            .into_values()
+            .filter_map(|peer| {
                 if let QueryPeerState::Succeeded = peer.state {
                     Some(peer.key.into_preimage())
                 } else {
@@ -394,9 +394,6 @@ struct QueryPeer<TNodeId> {
     /// The `KBucket` key used to identify the peer.
     key: Key<TNodeId>,
 
-    /// The current rpc request iteration that has been made on this peer.
-    iteration: usize,
-
     /// The number of peers that have been returned by this peer.
     peers_returned: usize,
 
@@ -408,7 +405,6 @@ impl<TNodeId> QueryPeer<TNodeId> {
     pub fn new(key: Key<TNodeId>, state: QueryPeerState) -> Self {
         QueryPeer {
             key,
-            iteration: 1,
             peers_returned: 0,
             state,
         }
@@ -446,9 +442,10 @@ enum QueryPeerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_util::GenRange;
     use enr::NodeId;
     use quickcheck::*;
-    use rand_07::{thread_rng, Rng};
+    use rand::RngExt;
     use std::time::Duration;
 
     type TestQuery = FindNodeQuery<NodeId>;
@@ -457,13 +454,13 @@ mod tests {
         (0..n).map(|_| NodeId::random())
     }
 
-    fn random_query<G: Rng>(g: &mut G) -> TestQuery {
-        let known_closest_peers = random_nodes(g.gen_range(1, 60)).map(Key::from);
+    fn random_query(g: &mut Gen) -> TestQuery {
+        let known_closest_peers = random_nodes(g.gen_range(1..60)).map(Key::from);
         let target = NodeId::random();
         let config = FindNodeQueryConfig {
-            parallelism: g.gen_range(1, 10),
-            num_results: g.gen_range(1, 25),
-            peer_timeout: Duration::from_secs(g.gen_range(10, 30)),
+            parallelism: g.gen_range(1..10),
+            num_results: g.gen_range(1..25),
+            peer_timeout: Duration::from_secs(g.gen_range(10..30) as u64),
         };
         FindNodeQuery::with_config(config, target.into(), known_closest_peers)
     }
@@ -471,18 +468,18 @@ mod tests {
     fn sorted(target: &Key<NodeId>, peers: &[Key<NodeId>]) -> bool {
         peers
             .windows(2)
-            .all(|w| w[0].distance(&target) < w[1].distance(&target))
+            .all(|w| w[0].distance(target) < w[1].distance(target))
     }
 
     impl Arbitrary for TestQuery {
-        fn arbitrary<G: Gen>(g: &mut G) -> TestQuery {
+        fn arbitrary(g: &mut Gen) -> TestQuery {
             random_query(g)
         }
     }
 
     #[test]
     fn new_query() {
-        let query = random_query(&mut thread_rng());
+        let query = random_query(&mut Gen::new(100));
         let target = query.target_key.clone();
 
         let (keys, states): (Vec<_>, Vec<_>) = query
@@ -514,7 +511,7 @@ mod tests {
     fn termination_and_parallelism() {
         fn prop(mut query: TestQuery) {
             let now = Instant::now();
-            let mut rng = thread_rng();
+            let mut rng = rand::rng();
 
             let mut expected = query
                 .closest_peers
@@ -559,8 +556,8 @@ mod tests {
                 // Report results back to the query with a random number of "closer"
                 // peers or an error, thus finishing the "in-flight requests".
                 for (i, k) in expected.iter().enumerate() {
-                    if rng.gen_bool(0.75) {
-                        let num_closer = rng.gen_range(0, query.config.num_results + 1);
+                    if rng.random_bool(0.75) {
+                        let num_closer = rng.random_range(0..query.config.num_results + 1);
                         let closer_peers = random_nodes(num_closer).collect::<Vec<_>>();
                         // let _: () = remaining;
                         remaining.extend(closer_peers.iter().map(|x| Key::from(*x)));
@@ -573,7 +570,7 @@ mod tests {
                 }
 
                 // Re-sort the remaining expected peers for the next "round".
-                remaining.sort_by_key(|k| target.distance(&k));
+                remaining.sort_by_key(|k| target.distance(k));
 
                 expected = remaining
             }

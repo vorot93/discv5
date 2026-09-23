@@ -6,27 +6,28 @@
 //! encryption and key-derivation algorithms. Future versions may abstract some of these to allow
 //! for different algorithms.
 use crate::{
-    error::Discv5Error,
+    error::Error,
     node_info::NodeContact,
     packet::{ChallengeData, MessageNonce},
 };
 use aes_gcm::{
-    aead::{generic_array::GenericArray, Aead, NewAead, Payload},
     Aes128Gcm,
+    aead::{Aead, KeyInit, Payload},
 };
 use ecdh::ecdh;
 use enr::{
+    CombinedKey, CombinedPublicKey, NodeId,
     k256::{
         self,
         ecdsa::{
-            signature::{DigestSigner, DigestVerifier, Signature as _},
             Signature,
+            signature::{DigestSigner, DigestVerifier},
         },
+        elliptic_curve::Generate,
+        sha2::{Sha256, digest::Update},
     },
-    CombinedKey, CombinedPublicKey, NodeId,
 };
 use hkdf::Hkdf;
-use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 
 mod ecdh;
@@ -48,18 +49,16 @@ pub(crate) fn generate_session_keys(
     local_id: &NodeId,
     contact: &NodeContact,
     challenge_data: &ChallengeData,
-) -> Result<(Key, Key, Vec<u8>), Discv5Error> {
+) -> Result<(Key, Key, Vec<u8>), Error> {
     let (secret, ephem_pk) = {
         match contact.public_key() {
             CombinedPublicKey::Secp256k1(remote_pk) => {
-                let ephem_sk = k256::ecdsa::SigningKey::random(rand::thread_rng());
+                let ephem_sk = k256::ecdsa::SigningKey::generate_from_rng(&mut rand::rng());
                 let secret = ecdh(&remote_pk, &ephem_sk);
-                let ephem_pk = ephem_sk.verify_key();
-                (secret, ephem_pk.to_bytes().to_vec())
+                let ephem_pk = ephem_sk.verifying_key();
+                (secret, ephem_pk.to_sec1_bytes().to_vec())
             }
-            CombinedPublicKey::Ed25519(_) => {
-                return Err(Discv5Error::KeyTypeNotSupported("Ed25519"))
-            }
+            CombinedPublicKey::Ed25519(_) => return Err(Error::KeyTypeNotSupported("Ed25519")),
         }
     };
 
@@ -74,7 +73,7 @@ fn derive_key(
     first_id: &NodeId,
     second_id: &NodeId,
     challenge_data: &ChallengeData,
-) -> Result<(Key, Key), Discv5Error> {
+) -> Result<(Key, Key), Error> {
     let mut info = [0u8; INFO_LENGTH];
     info[0..26].copy_from_slice(KEY_AGREEMENT_STRING.as_bytes());
     info[26..26 + NODE_ID_LENGTH].copy_from_slice(&first_id.raw());
@@ -84,7 +83,7 @@ fn derive_key(
 
     let mut okm = [0u8; 2 * KEY_LENGTH];
     hk.expand(&info, &mut okm)
-        .map_err(|_| Discv5Error::KeyDerivationFailed)?;
+        .map_err(|_| Error::KeyDerivationFailed)?;
 
     let mut initiator_key: Key = Default::default();
     let mut recipient_key: Key = Default::default();
@@ -101,17 +100,17 @@ pub(crate) fn derive_keys_from_pubkey(
     remote_id: &NodeId,
     challenge_data: &ChallengeData,
     ephem_pubkey: &[u8],
-) -> Result<(Key, Key), Discv5Error> {
+) -> Result<(Key, Key), Error> {
     let secret = {
         match local_key {
             CombinedKey::Secp256k1(key) => {
                 // convert remote pubkey into secp256k1 public key
                 // the key type should match our own node record
                 let remote_pubkey = k256::ecdsa::VerifyingKey::from_sec1_bytes(ephem_pubkey)
-                    .map_err(|_| Discv5Error::InvalidRemotePublicKey)?;
-                ecdh(&remote_pubkey, &key)
+                    .map_err(|_| Error::InvalidRemotePublicKey)?;
+                ecdh(&remote_pubkey, key)
             }
-            CombinedKey::Ed25519(_) => return Err(Discv5Error::KeyTypeNotSupported("Ed25519")),
+            CombinedKey::Ed25519(_) => return Err(Error::KeyTypeNotSupported("Ed25519")),
         }
     };
 
@@ -127,18 +126,20 @@ pub(crate) fn sign_nonce(
     challenge_data: &ChallengeData,
     ephem_pubkey: &[u8],
     dst_id: &NodeId,
-) -> Result<Vec<u8>, Discv5Error> {
+) -> Result<Vec<u8>, Error> {
     let signing_message = generate_signing_nonce(challenge_data, ephem_pubkey, dst_id);
 
     match signing_key {
         CombinedKey::Secp256k1(key) => {
-            let message = Sha256::new().chain(signing_message);
             let signature: Signature = key
-                .try_sign_digest(message)
-                .map_err(|e| Discv5Error::Error(format!("Failed to sign message: {}", e)))?;
-            Ok(signature.as_bytes().to_vec())
+                .try_sign_digest(|d: &mut Sha256| {
+                    d.update(&signing_message);
+                    Ok(())
+                })
+                .map_err(|e| Error::Error(format!("Failed to sign message: {e}")))?;
+            Ok(signature.to_vec())
         }
-        CombinedKey::Ed25519(_) => Err(Discv5Error::KeyTypeNotSupported("Ed25519")),
+        CombinedKey::Ed25519(_) => Err(Error::KeyTypeNotSupported("Ed25519")),
     }
 }
 
@@ -156,7 +157,13 @@ pub(crate) fn verify_authentication_nonce(
         CombinedPublicKey::Secp256k1(key) => {
             if let Ok(sig) = k256::ecdsa::Signature::try_from(sig) {
                 return key
-                    .verify_digest(Sha256::new().chain(signing_nonce), &sig)
+                    .verify_digest(
+                        |d: &mut Sha256| {
+                            d.update(&signing_nonce);
+                            Ok(())
+                        },
+                        &sig,
+                    )
                     .is_ok();
             }
             false
@@ -179,7 +186,7 @@ fn generate_signing_nonce(
     let mut data = ID_SIGNATURE_TEXT.as_bytes().to_vec();
     data.extend_from_slice(challenge_data.as_ref());
     data.extend_from_slice(ephem_pubkey);
-    data.extend_from_slice(&dst_id.raw().to_vec());
+    data.extend_from_slice(dst_id.raw().as_ref());
     data
 }
 
@@ -191,17 +198,17 @@ pub(crate) fn decrypt_message(
     message_nonce: MessageNonce,
     msg: &[u8],
     aad: &[u8],
-) -> Result<Vec<u8>, Discv5Error> {
+) -> Result<Vec<u8>, Error> {
     if msg.len() < 16 {
-        return Err(Discv5Error::DecryptionFailed(
+        return Err(Error::DecryptionFailed(
             "Message not long enough to contain a MAC".into(),
         ));
     }
 
-    let aead = Aes128Gcm::new(GenericArray::from_slice(key));
+    let aead = Aes128Gcm::new(key.into());
     let payload = Payload { msg, aad };
-    aead.decrypt(GenericArray::from_slice(&message_nonce), payload)
-        .map_err(|e| Discv5Error::DecryptionFailed(e.to_string()))
+    aead.decrypt(&message_nonce.into(), payload)
+        .map_err(|e| Error::DecryptionFailed(e.to_string()))
 }
 
 /* Encryption related functions */
@@ -213,17 +220,18 @@ pub(crate) fn encrypt_message(
     message_nonce: MessageNonce,
     msg: &[u8],
     aad: &[u8],
-) -> Result<Vec<u8>, Discv5Error> {
-    let aead = Aes128Gcm::new(GenericArray::from_slice(key));
+) -> Result<Vec<u8>, Error> {
+    let aead = Aes128Gcm::new(key.into());
     let payload = Payload { msg, aad };
-    aead.encrypt(GenericArray::from_slice(&message_nonce), payload)
-        .map_err(|e| Discv5Error::DecryptionFailed(e.to_string()))
+    aead.encrypt(&message_nonce.into(), payload)
+        .map_err(|e| Error::EncryptionFail(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enr::{CombinedKey, EnrBuilder, EnrKey};
+    use crate::ProtocolIdentity;
+    use enr::{CombinedKey, Enr, EnrKey};
     use std::convert::TryInto;
 
     fn hex_decode(x: &'static str) -> Vec<u8> {
@@ -259,7 +267,7 @@ mod tests {
                 .unwrap();
 
         let remote_pk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&remote_pubkey).unwrap();
-        let local_sk = k256::ecdsa::SigningKey::from_bytes(&local_secret_key).unwrap();
+        let local_sk = k256::ecdsa::SigningKey::from_slice(&local_secret_key).unwrap();
 
         let secret = ecdh(&remote_pk, &local_sk);
         assert_eq!(secret, expected_secret);
@@ -275,7 +283,7 @@ mod tests {
                 .unwrap();
 
         let remote_pk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&dest_pubkey).unwrap();
-        let local_sk = k256::ecdsa::SigningKey::from_bytes(&ephem_key).unwrap();
+        let local_sk = k256::ecdsa::SigningKey::from_slice(&ephem_key).unwrap();
 
         let secret = ecdh(&remote_pk, &local_sk);
 
@@ -304,12 +312,12 @@ mod tests {
                 .unwrap();
         let dst_id: NodeId = node_key_2().public().into();
 
-        println!("{}", dst_id);
+        println!("{dst_id}");
 
         let expected_sig = hex::decode("94852a1e2318c4e5e9d422c98eaf19d1d90d876b29cd06ca7cb7546d0fff7b484fe86c09a064fe72bdbef73ba8e9c34df0cd2b53e9d65528c2c7f336d5dfc6e6").unwrap();
 
         let challenge_data = ChallengeData::try_from(hex::decode("000000000000000000000000000000006469736376350001010102030405060708090a0b0c00180102030405060708090a0b0c0d0e0f100000000000000000").unwrap().as_slice()).unwrap();
-        let key = k256::ecdsa::SigningKey::from_bytes(&local_secret_key).unwrap();
+        let key = k256::ecdsa::SigningKey::from_slice(&local_secret_key).unwrap();
         let sig = sign_nonce(&key.into(), &challenge_data, &ephemeral_pubkey, &dst_id).unwrap();
 
         assert_eq!(sig, expected_sig);
@@ -341,8 +349,16 @@ mod tests {
         let node1_key = CombinedKey::generate_secp256k1();
         let node2_key = CombinedKey::generate_secp256k1();
 
-        let node1_enr = EnrBuilder::new("v4").build(&node1_key).unwrap();
-        let node2_enr = EnrBuilder::new("v4").build(&node2_key).unwrap();
+        let node1_enr = Enr::builder()
+            .ip("127.0.0.1".parse().unwrap())
+            .udp4(9000)
+            .build(&node1_key)
+            .unwrap();
+        let node2_enr = Enr::builder()
+            .ip("127.0.0.1".parse().unwrap())
+            .udp4(9000)
+            .build(&node2_key)
+            .unwrap();
 
         let challenge_data = vec![1; 63];
         let challenge_data = ChallengeData::try_from(challenge_data.as_slice()).unwrap();
@@ -384,8 +400,12 @@ mod tests {
     fn decrypt_ref_test_ping() {
         let dst_id: NodeId = node_key_2().public().into();
         let encoded_ref_packet = hex::decode("00000000000000000000000000000000088b3d4342774649325f313964a39e55ea96c005ad52be8c7560413a7008f16c9e6d2f43bbea8814a546b7409ce783d34c4f53245d08dab84102ed931f66d1492acb308fa1c6715b9d139b81acbdcc").unwrap();
-        let (_packet, auth_data) =
-            crate::packet::Packet::decode(&dst_id, &encoded_ref_packet).unwrap();
+        let (_packet, auth_data) = crate::packet::Packet::decode(
+            &dst_id,
+            ProtocolIdentity::default(),
+            &encoded_ref_packet,
+        )
+        .unwrap();
 
         let ciphertext = hex::decode("b84102ed931f66d1492acb308fa1c6715b9d139b81acbdcc").unwrap();
         let read_key = hex::decode("00000000000000000000000000000000").unwrap();
@@ -400,6 +420,6 @@ mod tests {
         dbg!(hex::encode(&message));
         let rpc = crate::rpc::Message::decode(&message).unwrap();
 
-        println!("{}", rpc);
+        println!("{rpc}");
     }
 }

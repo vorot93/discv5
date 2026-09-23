@@ -24,7 +24,6 @@
 #![allow(clippy::all)]
 
 use enr::NodeId;
-use sha2::digest::generic_array::{typenum::U32, GenericArray};
 use uint::construct_uint;
 
 construct_uint! {
@@ -44,7 +43,7 @@ construct_uint! {
 #[derive(Clone, Debug)]
 pub struct Key<T> {
     preimage: T,
-    hash: GenericArray<u8, U32>,
+    hash: [u8; 32],
 }
 
 impl<T> PartialEq for Key<T> {
@@ -63,7 +62,7 @@ impl<TPeerId> AsRef<Key<TPeerId>> for Key<TPeerId> {
 
 impl<T> Key<T> {
     /// Construct a new `Key` by providing the raw 32 byte hash.
-    pub fn new_raw(preimage: T, hash: GenericArray<u8, U32>) -> Key<T> {
+    pub fn new_raw(preimage: T, hash: [u8; 32]) -> Key<T> {
         Key { preimage, hash }
     }
 
@@ -79,8 +78,8 @@ impl<T> Key<T> {
 
     /// Computes the distance of the keys according to the XOR metric.
     pub fn distance<U>(&self, other: &Key<U>) -> Distance {
-        let a = U256::from(self.hash.as_slice());
-        let b = U256::from(other.hash.as_slice());
+        let a = U256::from_big_endian(self.hash.as_slice());
+        let b = U256::from_big_endian(other.hash.as_slice());
         Distance(a ^ b)
     }
 
@@ -90,11 +89,7 @@ impl<T> Key<T> {
     pub fn log2_distance<U>(&self, other: &Key<U>) -> Option<u64> {
         let xor_dist = self.distance(other);
         let log_dist = u64::from(256 - xor_dist.0.leading_zeros());
-        if log_dist == 0 {
-            None
-        } else {
-            Some(log_dist)
-        }
+        if log_dist == 0 { None } else { Some(log_dist) }
     }
 }
 
@@ -102,7 +97,7 @@ impl From<NodeId> for Key<NodeId> {
     fn from(node_id: NodeId) -> Self {
         Key {
             preimage: node_id,
-            hash: *GenericArray::from_slice(&node_id.raw()),
+            hash: node_id.raw(),
         }
     }
 }
@@ -114,11 +109,12 @@ pub struct Distance(pub(super) U256);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kbucket::bucket::tests::arbitrary_node_id;
     use quickcheck::*;
 
     impl Arbitrary for Key<NodeId> {
-        fn arbitrary<G: Gen>(_: &mut G) -> Key<NodeId> {
-            Key::from(NodeId::random())
+        fn arbitrary(g: &mut Gen) -> Key<NodeId> {
+            Key::from(arbitrary_node_id(g))
         }
     }
 

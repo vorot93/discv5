@@ -4,83 +4,96 @@ use enr::{CombinedPublicKey, NodeId};
 use std::net::SocketAddr;
 
 #[cfg(feature = "libp2p")]
-use libp2p_core::{identity::PublicKey, multiaddr::Protocol, multihash, Multiaddr};
+use libp2p_identity::{KeyType, PublicKey};
+#[cfg(feature = "libp2p")]
+use multiaddr::{Multiaddr, Protocol};
 
 /// This type relaxes the requirement of having an ENR to connect to a node, to allow for unsigned
 /// connection types, such as multiaddrs.
 #[derive(Debug, Clone, PartialEq)]
-pub enum NodeContact {
-    /// We know the ENR of the node we are contacting.
-    Enr(Box<Enr>),
-    /// We don't have an ENR, but have enough information to start a handshake.
-    ///
-    /// The handshake will request the ENR at the first opportunity.
-    /// The public key can be derived from multiaddr's whose keys can be inlined. The `TryFrom`
-    /// implementation for `String` and `MultiAddr`. This is gated behind the `libp2p` feature.
-    Raw {
-        /// An ENR compatible public key, required for handshaking with peers.
-        public_key: Box<CombinedPublicKey>,
-        /// The socket address and `NodeId` of the peer to connect to.
-        node_address: Box<NodeAddress>,
-    },
+pub struct NodeContact {
+    /// Key to use for communications with this node.
+    public_key: CombinedPublicKey,
+    /// Address to use to contact the node.
+    socket_addr: SocketAddr,
+    /// The ENR of the node if known.
+    enr: Option<Enr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NonContactable {
+    pub enr: Enr,
 }
 
 impl NodeContact {
+    pub fn new(public_key: CombinedPublicKey, socket_addr: SocketAddr, enr: Option<Enr>) -> Self {
+        NodeContact {
+            public_key,
+            socket_addr,
+            enr,
+        }
+    }
+
     pub fn node_id(&self) -> NodeId {
-        match self {
-            NodeContact::Enr(enr) => enr.node_id(),
-            NodeContact::Raw { node_address, .. } => node_address.node_id,
+        match self.enr {
+            Some(ref enr) => enr.node_id(),
+            None => self.public_key.clone().into(),
         }
     }
 
     pub fn seq_no(&self) -> Option<u64> {
-        match self {
-            NodeContact::Enr(enr) => Some(enr.seq()),
-            _ => None,
-        }
+        self.enr.as_ref().map(|enr| enr.seq())
     }
 
     pub fn public_key(&self) -> CombinedPublicKey {
-        match self {
-            NodeContact::Enr(ref enr) => enr.public_key(),
-            NodeContact::Raw { public_key, .. } => *public_key.clone(),
+        self.public_key.clone()
+    }
+
+    pub fn enr(&self) -> Option<Enr> {
+        self.enr.clone()
+    }
+
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.socket_addr
+    }
+
+    pub fn node_address(&self) -> NodeAddress {
+        NodeAddress {
+            socket_addr: self.socket_addr,
+            node_id: self.node_id(),
         }
     }
 
-    pub fn is_enr(&self) -> bool {
-        matches!(self, NodeContact::Enr(_))
-    }
-
-    pub fn udp_socket(&self) -> Result<SocketAddr, &'static str> {
-        match self {
-            NodeContact::Enr(enr) => enr
-                .udp_socket()
-                .ok_or("ENR does not contain an IP and UDP port"),
-            NodeContact::Raw { node_address, .. } => Ok(node_address.socket_addr),
-        }
-    }
-
-    pub fn node_address(&self) -> Result<NodeAddress, &'static str> {
-        let socket_addr = self.udp_socket()?;
-        let node_id = self.node_id();
-        Ok(NodeAddress {
+    pub fn to_address_and_enr(self) -> (NodeAddress, Option<Enr>) {
+        let NodeContact {
+            public_key,
             socket_addr,
-            node_id,
+            enr,
+        } = self;
+        (
+            NodeAddress {
+                node_id: public_key.into(),
+                socket_addr,
+            },
+            enr,
+        )
+    }
+
+    pub fn try_from_enr(enr: Enr, ip_mode: IpMode) -> Result<Self, NonContactable> {
+        let socket_addr = match ip_mode.get_contactable_addr(&enr) {
+            Some(socket_addr) => socket_addr,
+            None => return Err(NonContactable { enr }),
+        };
+
+        Ok(NodeContact {
+            public_key: enr.public_key(),
+            socket_addr,
+            enr: Some(enr),
         })
     }
-}
 
-impl From<Enr> for NodeContact {
-    fn from(enr: Enr) -> Self {
-        NodeContact::Enr(Box::new(enr))
-    }
-}
-
-#[cfg(feature = "libp2p")]
-impl std::convert::TryFrom<Multiaddr> for NodeContact {
-    type Error = &'static str;
-
-    fn try_from(multiaddr: Multiaddr) -> Result<Self, Self::Error> {
+    #[cfg(feature = "libp2p")]
+    pub fn try_from_multiaddr(multiaddr: Multiaddr) -> Result<Self, &'static str> {
         // The multiaddr must contain either the ip4 or ip6 protocols, the UDP protocol and the P2P
         // protocol with either secp256k1 or ed25519 keys.
 
@@ -94,54 +107,54 @@ impl std::convert::TryFrom<Multiaddr> for NodeContact {
                 Protocol::Udp(port) => udp_port = Some(port),
                 Protocol::Ip4(addr) => ip_addr = Some(addr.into()),
                 Protocol::Ip6(addr) => ip_addr = Some(addr.into()),
-                Protocol::P2p(multihash) => p2p = Some(multihash),
+                Protocol::P2p(peer_id) => p2p = Some(peer_id),
                 _ => {}
             }
         }
 
         let udp_port = udp_port.ok_or("A UDP port must be specified in the multiaddr")?;
         let ip_addr = ip_addr.ok_or("An IP address must be specified in the multiaddr")?;
-        let multihash = p2p.ok_or("The p2p protocol must be specified in the multiaddr")?;
+        let peer_id = p2p.ok_or("The p2p protocol must be specified in the multiaddr")?;
 
-        // verify the correct key type
-        if multihash.code() != u64::from(multihash::Code::Identity) {
-            return Err("The key type is unsupported");
-        }
-
-        let public_key: CombinedPublicKey =
-            match PublicKey::from_protobuf_encoding(&multihash.to_bytes()[2..])
-                .map_err(|_| "Invalid public key")?
-            {
-                PublicKey::Secp256k1(pk) => {
-                    // TODO: Remove libp2p dep to avoid conversion here
-                    enr::k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk.encode_uncompressed())
-                        .expect("Libp2p key conversion, always valid")
-                        .into()
-                }
-                PublicKey::Ed25519(pk) => enr::ed25519_dalek::PublicKey::from_bytes(&pk.encode())
-                    .expect("Libp2p key conversion, always valid")
-                    .into(),
+        let public_key: CombinedPublicKey = {
+            let pk = PublicKey::try_decode_protobuf(&peer_id.to_bytes()[2..])
+                .map_err(|_| "Invalid public key")?;
+            match pk.key_type() {
+                KeyType::Secp256k1 => enr::k256::ecdsa::VerifyingKey::from_sec1_bytes(
+                    &pk.try_into_secp256k1()
+                        .expect("Must be secp256k1")
+                        .to_bytes_uncompressed(),
+                )
+                .expect("Libp2p key conversion, always valid")
+                .into(),
+                KeyType::Ed25519 => enr::ed25519_dalek::VerifyingKey::from_bytes(
+                    &pk.try_into_ed25519().expect("Must be ed25519").to_bytes(),
+                )
+                .expect("Libp2p key conversion, always valid")
+                .into(),
                 _ => return Err("The key type is not supported"),
-            };
+            }
+        };
 
-        Ok(NodeContact::Raw {
-            public_key: Box::new(public_key.clone()),
-            node_address: Box::new(NodeAddress {
-                socket_addr: SocketAddr::new(ip_addr, udp_port),
-                node_id: public_key.into(),
-            }),
+        Ok(NodeContact {
+            public_key,
+            socket_addr: SocketAddr::new(ip_addr, udp_port),
+            enr: None,
         })
+    }
+}
+
+#[cfg(test)]
+impl From<Enr> for NodeContact {
+    #[track_caller]
+    fn from(enr: Enr) -> Self {
+        NodeContact::try_from_enr(enr, IpMode::default()).unwrap()
     }
 }
 
 impl std::fmt::Display for NodeContact {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NodeContact::Enr(enr) => {
-                write!(f, "Node: {}, addr: {:?}", enr.node_id(), enr.udp_socket())
-            }
-            NodeContact::Raw { node_address, .. } => write!(f, "{}", node_address),
-        }
+        write!(f, "Node: {}, addr: {:?}", self.node_id(), self.socket_addr)
     }
 }
 

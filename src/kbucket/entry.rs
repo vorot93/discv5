@@ -25,11 +25,9 @@
 //! representing the nodes participating in the Kademlia DHT.
 
 pub use super::{
-    bucket::{
-        AppliedPending, ConnectionState, InsertResult, Node, NodeStatus, MAX_NODES_PER_BUCKET,
-    },
-    key::*,
     ConnectionDirection,
+    bucket::{AppliedPending, ConnectionState, InsertResult, Node, NodeStatus},
+    key::*,
 };
 
 use super::*;
@@ -66,6 +64,7 @@ impl<TPeerId, TVal: Eq> AsRef<Key<TPeerId>> for EntryView<TPeerId, TVal> {
 
 /// A reference into a single entry of a `KBucketsTable`.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum Entry<'a, TPeerId, TVal: Eq> {
     /// The entry is present in a bucket.
     Present(PresentEntry<'a, TPeerId, TVal>, NodeStatus),
@@ -118,7 +117,17 @@ where
     }
 
     /// Returns the value associated with the key.
-    pub fn value(&mut self) -> &mut TVal {
+    pub fn value(&self) -> &TVal {
+        &self
+            .0
+            .bucket
+            .get(self.0.key)
+            .expect("We can only build a ConnectedEntry if the entry is in the bucket; QED")
+            .value
+    }
+
+    /// Returns mutable access value associated with the key.
+    pub fn value_mut(&mut self) -> &mut TVal {
         &mut self
             .0
             .bucket
@@ -128,9 +137,22 @@ where
     }
 
     /// Sets the status of the entry.
-    pub fn update(self, state: ConnectionState, direction: Option<ConnectionDirection>) -> Self {
-        let _ = self.0.bucket.update_status(self.0.key, state, direction);
-        Self::new(self.0.bucket, self.0.key)
+    /// This can fail if the new state violates buckets or table conditions.
+    pub fn update(
+        self,
+        state: ConnectionState,
+        direction: Option<ConnectionDirection>,
+    ) -> Result<Self, FailureReason> {
+        match self.0.bucket.update_status(self.0.key, state, direction) {
+            UpdateResult::Failed(reason) => Err(reason),
+            UpdateResult::UpdatedAndPromoted
+            | UpdateResult::Updated
+            | UpdateResult::UpdatedPending
+            | UpdateResult::NotModified => {
+                // Successful update, return the new entry
+                Ok(Self::new(self.0.bucket, self.0.key))
+            }
+        }
     }
 
     /// Removes the entry from the table.
@@ -153,7 +175,15 @@ where
     }
 
     /// Returns the value associated with the key.
-    pub fn value(&mut self) -> &mut TVal {
+    pub fn value(&self) -> &TVal {
+        self.0
+            .bucket
+            .pending()
+            .expect("We can only build a ConnectedPendingEntry if the entry is pending; QED")
+            .value()
+    }
+
+    pub fn value_mut(&mut self) -> &mut TVal {
         self.0
             .bucket
             .pending_mut()

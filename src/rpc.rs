@@ -1,9 +1,14 @@
+use alloy_rlp::{
+    Decodable, Encodable, Error as DecoderError, Header,
+    bytes::{Buf, Bytes, BytesMut},
+};
 use enr::{CombinedKey, Enr};
-use rlp::{DecoderError, RlpStream};
-use std::net::{IpAddr, Ipv6Addr};
+use std::{
+    convert::TryInto,
+    net::{IpAddr, Ipv6Addr},
+    num::NonZeroU16,
+};
 use tracing::{debug, warn};
-
-type TopicHash = [u8; 32];
 
 /// Type to manage the request IDs.
 #[derive(Debug, Clone, PartialEq, Hash, Eq)]
@@ -34,7 +39,7 @@ impl RequestId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// A combined type representing requests and responses.
 pub enum Message {
     /// A request, which contains its [`RequestId`].
@@ -43,7 +48,7 @@ pub enum Message {
     Response(Response),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// A request sent between nodes.
 pub struct Request {
     /// The [`RequestId`] of the request.
@@ -52,7 +57,7 @@ pub struct Request {
     pub body: RequestBody,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// A response sent in response to a [`Request`]
 pub struct Response {
     /// The [`RequestId`] of the request that triggered this response.
@@ -61,7 +66,7 @@ pub struct Response {
     pub body: ResponseBody,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestBody {
     /// A PING request.
     Ping {
@@ -80,17 +85,9 @@ pub enum RequestBody {
         /// The request.
         request: Vec<u8>,
     },
-    /// A REGISTERTOPIC request.
-    RegisterTopic {
-        topic: Vec<u8>,
-        enr: crate::Enr,
-        ticket: Vec<u8>,
-    },
-    /// A TOPICQUERY request.
-    TopicQuery { topic: TopicHash },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseBody {
     /// A PONG response.
     Pong {
@@ -99,7 +96,7 @@ pub enum ResponseBody {
         /// Our external IP address as observed by the responder.
         ip: IpAddr,
         /// Our external UDP port as observed by the responder.
-        port: u16,
+        port: NonZeroU16,
     },
     /// A NODES response.
     Nodes {
@@ -113,13 +110,6 @@ pub enum ResponseBody {
         /// The response for the talk.
         response: Vec<u8>,
     },
-    Ticket {
-        ticket: Vec<u8>,
-        wait_time: u64,
-    },
-    RegisterConfirmation {
-        topic: Vec<u8>,
-    },
 }
 
 impl Request {
@@ -128,8 +118,6 @@ impl Request {
             RequestBody::Ping { .. } => 1,
             RequestBody::FindNode { .. } => 3,
             RequestBody::Talk { .. } => 5,
-            RequestBody::RegisterTopic { .. } => 7,
-            RequestBody::TopicQuery { .. } => 10,
         }
     }
 
@@ -141,49 +129,40 @@ impl Request {
         let id = &self.id;
         match self.body {
             RequestBody::Ping { enr_seq } => {
-                let mut s = RlpStream::new();
-                s.begin_list(2);
-                s.append(&id.as_bytes());
-                s.append(&enr_seq);
-                buf.extend_from_slice(&s.out());
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                enr_seq.encode(&mut list);
+                let header = Header {
+                    list: true,
+                    payload_length: list.len(),
+                };
+                header.encode(&mut buf);
+                buf.extend_from_slice(&list);
                 buf
             }
             RequestBody::FindNode { distances } => {
-                let mut s = RlpStream::new();
-                s.begin_list(2);
-                s.append(&id.as_bytes());
-                s.begin_list(distances.len());
-                for distance in distances {
-                    s.append(&distance);
-                }
-                buf.extend_from_slice(&s.out());
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                distances.encode(&mut list);
+                let header = Header {
+                    list: true,
+                    payload_length: list.len(),
+                };
+                header.encode(&mut buf);
+                buf.extend_from_slice(&list);
                 buf
             }
             RequestBody::Talk { protocol, request } => {
-                let mut s = RlpStream::new();
-                s.begin_list(3);
-                s.append(&id.as_bytes());
-                s.append(&protocol);
-                s.append(&request);
-                buf.extend_from_slice(&s.out());
-                buf
-            }
-            RequestBody::RegisterTopic { topic, enr, ticket } => {
-                let mut s = RlpStream::new();
-                s.begin_list(4);
-                s.append(&id.as_bytes());
-                s.append(&topic);
-                s.append(&enr);
-                s.append(&ticket);
-                buf.extend_from_slice(&s.out());
-                buf
-            }
-            RequestBody::TopicQuery { topic } => {
-                let mut s = RlpStream::new();
-                s.begin_list(2);
-                s.append(&id.as_bytes());
-                s.append(&(&topic as &[u8]));
-                buf.extend_from_slice(&s.out());
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                protocol.as_slice().encode(&mut list);
+                request.as_slice().encode(&mut list);
+                let header = Header {
+                    list: true,
+                    payload_length: list.len(),
+                };
+                header.encode(&mut buf);
+                buf.extend_from_slice(&list);
                 buf
             }
         }
@@ -196,8 +175,6 @@ impl Response {
             ResponseBody::Pong { .. } => 2,
             ResponseBody::Nodes { .. } => 4,
             ResponseBody::Talk { .. } => 6,
-            ResponseBody::Ticket { .. } => 8,
-            ResponseBody::RegisterConfirmation { .. } => 9,
         }
     }
 
@@ -206,16 +183,9 @@ impl Response {
         match self.body {
             ResponseBody::Pong { .. } => matches!(req, RequestBody::Ping { .. }),
             ResponseBody::Nodes { .. } => {
-                matches!(
-                    req,
-                    RequestBody::FindNode { .. } | RequestBody::TopicQuery { .. }
-                )
+                matches!(req, RequestBody::FindNode { .. })
             }
             ResponseBody::Talk { .. } => matches!(req, RequestBody::Talk { .. }),
-            ResponseBody::Ticket { .. } => matches!(req, RequestBody::RegisterTopic { .. }),
-            ResponseBody::RegisterConfirmation { .. } => {
-                matches!(req, RequestBody::RegisterTopic { .. })
-            }
         }
     }
 
@@ -227,58 +197,62 @@ impl Response {
         let id = &self.id;
         match self.body {
             ResponseBody::Pong { enr_seq, ip, port } => {
-                let mut s = RlpStream::new();
-                s.begin_list(4);
-                s.append(&id.as_bytes());
-                s.append(&enr_seq);
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                enr_seq.encode(&mut list);
                 match ip {
-                    IpAddr::V4(addr) => s.append(&(&addr.octets() as &[u8])),
-                    IpAddr::V6(addr) => s.append(&(&addr.octets() as &[u8])),
+                    IpAddr::V4(addr) => addr.encode(&mut list),
+                    IpAddr::V6(addr) => addr.encode(&mut list),
                 };
-                s.append(&port);
-                buf.extend_from_slice(&s.out());
+                port.get().encode(&mut list);
+                let header = Header {
+                    list: true,
+                    payload_length: list.len(),
+                };
+                header.encode(&mut buf);
+                buf.extend_from_slice(&list);
                 buf
             }
             ResponseBody::Nodes { total, nodes } => {
-                let mut s = RlpStream::new();
-                s.begin_list(3);
-                s.append(&id.as_bytes());
-                s.append(&total);
-
-                if nodes.is_empty() {
-                    s.begin_list(0);
-                } else {
-                    s.begin_list(nodes.len());
-                    for node in nodes {
-                        s.append(&node);
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                total.encode(&mut list);
+                if !nodes.is_empty() {
+                    let mut out = BytesMut::new();
+                    for node in nodes.clone() {
+                        node.encode(&mut out);
                     }
+                    let tmp_header = Header {
+                        list: true,
+                        payload_length: out.len(),
+                    };
+                    let mut tmp_out = BytesMut::new();
+                    tmp_header.encode(&mut tmp_out);
+                    tmp_out.extend_from_slice(&out);
+                    list.extend_from_slice(&tmp_out);
+                } else {
+                    let mut out = BytesMut::new();
+                    nodes.encode(&mut out);
+                    list.extend_from_slice(&out);
                 }
-                buf.extend_from_slice(&s.out());
+                let header = Header {
+                    list: true,
+                    payload_length: list.len(),
+                };
+                header.encode(&mut buf);
+                buf.extend_from_slice(&list);
                 buf
             }
             ResponseBody::Talk { response } => {
-                let mut s = RlpStream::new();
-                s.begin_list(2);
-                s.append(&id.as_bytes());
-                s.append(&response);
-                buf.extend_from_slice(&s.out());
-                buf
-            }
-            ResponseBody::Ticket { ticket, wait_time } => {
-                let mut s = RlpStream::new();
-                s.begin_list(3);
-                s.append(&id.as_bytes());
-                s.append(&ticket);
-                s.append(&wait_time);
-                buf.extend_from_slice(&s.out());
-                buf
-            }
-            ResponseBody::RegisterConfirmation { topic } => {
-                let mut s = RlpStream::new();
-                s.begin_list(2);
-                s.append(&id.as_bytes());
-                s.append(&topic);
-                buf.extend_from_slice(&s.out());
+                let mut list = Vec::<u8>::new();
+                id.as_bytes().encode(&mut list);
+                response.as_slice().encode(&mut list);
+                let header = Header {
+                    list: true,
+                    payload_length: list.len(),
+                };
+                header.encode(&mut buf);
+                buf.extend_from_slice(&list);
                 buf
             }
         }
@@ -294,8 +268,8 @@ impl std::fmt::Display for RequestId {
 impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Message::Request(request) => write!(f, "{}", request),
-            Message::Response(response) => write!(f, "{}", response),
+            Message::Request(request) => write!(f, "{request}"),
+            Message::Response(response) => write!(f, "{response}"),
         }
     }
 }
@@ -309,19 +283,17 @@ impl std::fmt::Display for Response {
 impl std::fmt::Display for ResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResponseBody::Pong { enr_seq, ip, port } => write!(
-                f,
-                "PONG: Enr-seq: {}, Ip: {:?},  Port: {}",
-                enr_seq, ip, port
-            ),
+            ResponseBody::Pong { enr_seq, ip, port } => {
+                write!(f, "PONG: Enr-seq: {enr_seq}, Ip: {ip:?},  Port: {port}")
+            }
             ResponseBody::Nodes { total, nodes } => {
-                let _ = write!(f, "NODES: total: {}, Nodes: [", total);
+                write!(f, "NODES: total: {total}, Nodes: [")?;
                 let mut first = true;
                 for id in nodes {
                     if !first {
-                        write!(f, ", {}", id)?;
+                        write!(f, ", {id}")?;
                     } else {
-                        write!(f, "{}", id)?;
+                        write!(f, "{id}")?;
                     }
                     first = false;
                 }
@@ -330,12 +302,6 @@ impl std::fmt::Display for ResponseBody {
             }
             ResponseBody::Talk { response } => {
                 write!(f, "Response: Response {}", hex::encode(response))
-            }
-            ResponseBody::Ticket { ticket, wait_time } => {
-                write!(f, "TICKET: Ticket: {:?}, Wait time: {}", ticket, wait_time)
-            }
-            ResponseBody::RegisterConfirmation { topic } => {
-                write!(f, "REGTOPIC: Registered: {}", hex::encode(topic))
             }
         }
     }
@@ -350,23 +316,15 @@ impl std::fmt::Display for Request {
 impl std::fmt::Display for RequestBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RequestBody::Ping { enr_seq } => write!(f, "PING: enr_seq: {}", enr_seq),
+            RequestBody::Ping { enr_seq } => write!(f, "PING: enr_seq: {enr_seq}"),
             RequestBody::FindNode { distances } => {
-                write!(f, "FINDNODE Request: distance: {:?}", distances)
+                write!(f, "FINDNODE Request: distance: {distances:?}")
             }
             RequestBody::Talk { protocol, request } => write!(
                 f,
                 "TALK: protocol: {}, request: {}",
                 hex::encode(protocol),
                 hex::encode(request)
-            ),
-            RequestBody::TopicQuery { topic } => write!(f, "TOPICQUERY: topic: {:?}", topic),
-            RequestBody::RegisterTopic { topic, enr, ticket } => write!(
-                f,
-                "RegisterTopic: topic: {}, enr: {}, ticket: {}",
-                hex::encode(topic),
-                enr.to_base64(),
-                hex::encode(ticket)
             ),
         }
     }
@@ -382,50 +340,41 @@ impl Message {
 
     pub fn decode(data: &[u8]) -> Result<Self, DecoderError> {
         if data.len() < 3 {
-            return Err(DecoderError::RlpIsTooShort);
+            return Err(DecoderError::InputTooShort);
         }
 
         let msg_type = data[0];
 
-        let rlp = rlp::Rlp::new(&data[1..]);
+        let payload = &mut &data[1..];
 
-        let list_len = rlp.item_count().and_then(|size| {
-            if size < 2 {
-                Err(DecoderError::RlpIncorrectListLen)
-            } else {
-                Ok(size)
-            }
-        })?;
+        let header = Header::decode(payload)?;
+        if !header.list {
+            return Err(DecoderError::Custom("Invalid format of header"));
+        }
 
-        let id = RequestId::decode(rlp.val_at::<Vec<u8>>(0)?)?;
+        if header.payload_length != payload.len() {
+            return Err(DecoderError::Custom("Reject the extra data"));
+        }
+
+        let id_bytes = Bytes::decode(payload)?;
+        let id = RequestId::decode(id_bytes.to_vec())?;
 
         let message = match msg_type {
             1 => {
                 // PingRequest
-                if list_len != 2 {
-                    debug!(
-                        "Ping Request has an invalid RLP list length. Expected 2, found {}",
-                        list_len
-                    );
-                    return Err(DecoderError::RlpIncorrectListLen);
+                let enr_seq = u64::decode(payload)?;
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
                 }
                 Message::Request(Request {
                     id,
-                    body: RequestBody::Ping {
-                        enr_seq: rlp.val_at::<u64>(1)?,
-                    },
+                    body: RequestBody::Ping { enr_seq },
                 })
             }
             2 => {
                 // PingResponse
-                if list_len != 4 {
-                    debug!(
-                        "Ping Response has an invalid RLP list length. Expected 4, found {}",
-                        list_len
-                    );
-                    return Err(DecoderError::RlpIncorrectListLen);
-                }
-                let ip_bytes = rlp.val_at::<Vec<u8>>(2)?;
+                let enr_seq = u64::decode(payload)?;
+                let ip_bytes = Bytes::decode(payload)?;
                 let ip = match ip_bytes.len() {
                     4 => {
                         let mut ip = [0u8; 4];
@@ -436,8 +385,13 @@ impl Message {
                         let mut ip = [0u8; 16];
                         ip.copy_from_slice(&ip_bytes);
                         let ipv6 = Ipv6Addr::from(ip);
-                        // If the ipv6 is ipv4 compatible/mapped, simply return the ipv4.
-                        if let Some(ipv4) = ipv6.to_ipv4() {
+
+                        if ipv6.is_loopback() {
+                            // Checking if loopback address since IPv6Addr::to_ipv4 returns
+                            // IPv4 address for IPv6 loopback address.
+                            IpAddr::V6(ipv6)
+                        } else if let Some(ipv4) = ipv6.to_ipv4() {
+                            // If the ipv6 is ipv4 compatible/mapped, simply return the ipv4.
                             IpAddr::V4(ipv4)
                         } else {
                             IpAddr::V6(ipv6)
@@ -445,47 +399,39 @@ impl Message {
                     }
                     _ => {
                         debug!("Ping Response has incorrect byte length for IP");
-                        return Err(DecoderError::RlpIncorrectListLen);
+                        return Err(DecoderError::Custom("Incorrect List Length"));
                     }
                 };
-                let port = rlp.val_at::<u16>(3)?;
-                Message::Response(Response {
-                    id,
-                    body: ResponseBody::Pong {
-                        enr_seq: rlp.val_at::<u64>(1)?,
-                        ip,
-                        port,
-                    },
-                })
+                let raw_port = u16::decode(payload)?;
+                if let Ok(port) = raw_port.try_into() {
+                    if !payload.is_empty() {
+                        return Err(DecoderError::Custom("Payload should be empty"));
+                    }
+                    Message::Response(Response {
+                        id,
+                        body: ResponseBody::Pong { enr_seq, ip, port },
+                    })
+                } else {
+                    debug!(raw_port, "The port number should be non zero");
+                    return Err(DecoderError::Custom("PONG response port number invalid"));
+                }
             }
             3 => {
                 // FindNodeRequest
-                if list_len != 2 {
-                    debug!(
-                        "FindNode Request has an invalid RLP list length. Expected 2, found {}",
-                        list_len
-                    );
-                    return Err(DecoderError::RlpIncorrectListLen);
-                }
-                let distances = rlp.list_at::<u64>(1)?;
+                let distances = Vec::<u64>::decode(payload)?;
 
-                if distances.len() > 10 {
-                    warn!(
-                        "Rejected FindNode request asking for too many buckets {}, maximum 10",
-                        distances.len()
-                    );
-                    return Err(DecoderError::Custom("FINDNODE request too large"));
-                }
                 for distance in distances.iter() {
                     if distance > &256u64 {
                         warn!(
-                            "Rejected FindNode request asking for unknown distance {}, maximum 256",
-                            distance
+                            distance,
+                            "Rejected FindNode request asking for unknown distance maximum 256",
                         );
                         return Err(DecoderError::Custom("FINDNODE request distance invalid"));
                     }
                 }
-
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
+                }
                 Message::Request(Request {
                     id,
                     body: RequestBody::FindNode { distances },
@@ -493,42 +439,51 @@ impl Message {
             }
             4 => {
                 // NodesResponse
-                if list_len != 3 {
-                    debug!(
-                        "Nodes Response has an invalid RLP list length. Expected 3, found {}",
-                        list_len
-                    );
-                    return Err(DecoderError::RlpIncorrectListLen);
-                }
-
+                let total = u64::decode(payload)?;
                 let nodes = {
-                    let enr_list_rlp = rlp.at(2)?;
+                    let header = Header::decode(payload)?;
+                    if !header.list {
+                        return Err(DecoderError::Custom("Invalid format of header"));
+                    }
+                    let mut enr_list_rlp = Vec::<Enr<CombinedKey>>::new();
+                    while !payload.is_empty() {
+                        let node_header = Header::decode(&mut &payload[..])?;
+                        if !node_header.list {
+                            return Err(DecoderError::Custom("Invalid format of header"));
+                        }
+                        if node_header.length_with_payload() > payload.len() {
+                            return Err(DecoderError::Custom(
+                                "Payload size is smaller than payload_length",
+                            ));
+                        }
+                        let enr_rlp = Enr::<CombinedKey>::decode(
+                            &mut &payload[..node_header.length_with_payload()],
+                        )?;
+                        payload.advance(enr_rlp.size());
+                        enr_list_rlp.append(&mut vec![enr_rlp]);
+                    }
                     if enr_list_rlp.is_empty() {
                         // no records
                         vec![]
                     } else {
-                        enr_list_rlp.as_list::<Enr<CombinedKey>>()?
+                        enr_list_rlp
                     }
                 };
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
+                }
                 Message::Response(Response {
                     id,
-                    body: ResponseBody::Nodes {
-                        total: rlp.val_at::<u64>(1)?,
-                        nodes,
-                    },
+                    body: ResponseBody::Nodes { total, nodes },
                 })
             }
             5 => {
                 // Talk Request
-                if list_len != 3 {
-                    debug!(
-                        "Talk Request has an invalid RLP list length. Expected 3, found {}",
-                        list_len
-                    );
-                    return Err(DecoderError::RlpIncorrectListLen);
+                let protocol = Bytes::decode(payload)?.to_vec();
+                let request = Bytes::decode(payload)?.to_vec();
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
                 }
-                let protocol = rlp.val_at::<Vec<u8>>(1)?;
-                let request = rlp.val_at::<Vec<u8>>(2)?;
                 Message::Request(Request {
                     id,
                     body: RequestBody::Talk { protocol, request },
@@ -536,74 +491,20 @@ impl Message {
             }
             6 => {
                 // Talk Response
-                if list_len != 2 {
-                    debug!(
-                        "Talk Response has an invalid RLP list length. Expected 2, found {}",
-                        list_len
-                    );
-                    return Err(DecoderError::RlpIncorrectListLen);
+                let response = Bytes::decode(payload)?;
+                if !payload.is_empty() {
+                    return Err(DecoderError::Custom("Payload should be empty"));
                 }
-                let response = rlp.val_at::<Vec<u8>>(1)?;
                 Message::Response(Response {
                     id,
-                    body: ResponseBody::Talk { response },
+                    body: ResponseBody::Talk {
+                        response: response.to_vec(),
+                    },
                 })
             }
             _ => {
                 return Err(DecoderError::Custom("Unknown RPC message type"));
-            } /*
-               * All other RPC messages are currently not supported as per the 5.1 specification.
-
-              7 => {
-                  // RegisterTopicRequest
-                  if list_len != 2 {
-                      debug!("RegisterTopic Request has an invalid RLP list length. Expected 2, found {}", list_len);
-                      return Err(DecoderError::RlpIncorrectListLen);
-                  }
-                  let ticket = rlp.val_at::<Vec<u8>>(1)?;
-                  Message::Request(Request {
-                      id,
-                      body: RequestBody::RegisterTopic { ticket },
-                  })
-              }
-              8 => {
-                  // RegisterTopicResponse
-                  if list_len != 2 {
-                      debug!("RegisterTopic Response has an invalid RLP list length. Expected 2, found {}", list_len);
-                      return Err(DecoderError::RlpIncorrectListLen);
-                  }
-                  Message::Response(Response {
-                      id,
-                      body: ResponseBody::RegisterTopic {
-                          registered: rlp.val_at::<bool>(1)?,
-                      },
-                  })
-              }
-              9 => {
-                  // TopicQueryRequest
-                  if list_len != 2 {
-                      debug!(
-                          "TopicQuery Request has an invalid RLP list length. Expected 2, found {}",
-                          list_len
-                      );
-                      return Err(DecoderError::RlpIncorrectListLen);
-                  }
-                  let topic = {
-                      let topic_bytes = rlp.val_at::<Vec<u8>>(1)?;
-                      if topic_bytes.len() > 32 {
-                          debug!("Ticket Request has a topic greater than 32 bytes");
-                          return Err(DecoderError::RlpIsTooBig);
-                      }
-                      let mut topic = [0u8; 32];
-                      topic[32 - topic_bytes.len()..].copy_from_slice(&topic_bytes);
-                      topic
-                  };
-                  Message::Request(Request {
-                      id,
-                      body: RequestBody::TopicQuery { topic },
-                  })
-              }
-              */
+            }
         };
 
         Ok(message)
@@ -613,7 +514,7 @@ impl Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use enr::EnrBuilder;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn ref_test_encode_request_ping() {
@@ -658,7 +559,11 @@ mod tests {
         let port = 5000;
         let message = Message::Response(Response {
             id,
-            body: ResponseBody::Pong { enr_seq, ip, port },
+            body: ResponseBody::Pong {
+                enr_seq,
+                ip,
+                port: port.try_into().unwrap(),
+            },
         });
 
         // expected hex output
@@ -775,7 +680,51 @@ mod tests {
             body: ResponseBody::Pong {
                 enr_seq: 15,
                 ip: "127.0.0.1".parse().unwrap(),
-                port: 80,
+                port: 80.try_into().unwrap(),
+            },
+        });
+
+        let encoded = request.clone().encode();
+        let decoded = Message::decode(&encoded).unwrap();
+
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn encode_decode_ping_response_ipv4_mapped() {
+        let id = RequestId(vec![1]);
+        let request = Message::Response(Response {
+            id: id.clone(),
+            body: ResponseBody::Pong {
+                enr_seq: 15,
+                ip: IpAddr::V6(Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped()),
+                port: 80.try_into().unwrap(),
+            },
+        });
+
+        let encoded = request.encode();
+        let decoded = Message::decode(&encoded).unwrap();
+        let expected = Message::Response(Response {
+            id,
+            body: ResponseBody::Pong {
+                enr_seq: 15,
+                ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+                port: 80.try_into().unwrap(),
+            },
+        });
+
+        assert_eq!(expected, decoded);
+    }
+
+    #[test]
+    fn encode_decode_ping_response_ipv6_loopback() {
+        let id = RequestId(vec![1]);
+        let request = Message::Response(Response {
+            id,
+            body: ResponseBody::Pong {
+                enr_seq: 15,
+                ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+                port: 80.try_into().unwrap(),
             },
         });
 
@@ -804,17 +753,17 @@ mod tests {
     #[test]
     fn encode_decode_nodes_response() {
         let key = CombinedKey::generate_secp256k1();
-        let enr1 = EnrBuilder::new("v4")
-            .ip("127.0.0.1".parse().unwrap())
-            .udp(500)
+        let enr1 = Enr::builder()
+            .ip4("127.0.0.1".parse().unwrap())
+            .udp4(500)
             .build(&key)
             .unwrap();
-        let enr2 = EnrBuilder::new("v4")
-            .ip("10.0.0.1".parse().unwrap())
-            .tcp(8080)
+        let enr2 = Enr::builder()
+            .ip4("10.0.0.1".parse().unwrap())
+            .tcp4(8080)
             .build(&key)
             .unwrap();
-        let enr3 = EnrBuilder::new("v4")
+        let enr3 = Enr::builder()
             .ip("10.4.5.6".parse().unwrap())
             .build(&key)
             .unwrap();
@@ -836,183 +785,111 @@ mod tests {
     }
 
     #[test]
-    fn encode_decode_ticket_request() {
-        let id = RequestId(vec![1]);
-        let request = Message::Request(Request {
+    fn reject_extra_data() {
+        let data = [6, 194, 0, 75];
+        let msg = Message::decode(&data).unwrap();
+        assert_eq!(
+            msg,
+            Message::Response(Response {
+                id: RequestId(vec![0]),
+                body: ResponseBody::Talk { response: vec![75] }
+            })
+        );
+        assert_eq!(data.to_vec(), msg.encode());
+
+        let data2 = [6, 193, 0, 75, 252];
+        Message::decode(&data2).expect_err("should reject extra data");
+
+        let data3 = [6, 194, 0, 75, 252];
+        Message::decode(&data3).expect_err("should reject extra data");
+
+        let data4 = [6, 193, 0, 63];
+        Message::decode(&data4).expect_err("should reject extra data");
+
+        let data5 = [6, 193, 128, 75];
+        Message::decode(&data5).expect_err("should reject extra data");
+
+        let data6 = [6, 193, 128, 128];
+        Message::decode(&data6).expect_err("should reject extra data");
+    }
+
+    #[test]
+    fn test_encode_request_talk_request() {
+        // reference input
+        let id = RequestId(vec![113, 236, 255, 66, 31, 191, 221, 86]);
+        let message = Message::Request(Request {
             id,
             body: RequestBody::Talk {
-                protocol: vec![17u8; 32],
-                request: vec![1, 2, 3],
+                protocol: hex::decode("757470").unwrap(),
+                request: hex::decode("0100a028839e1549000003ef001000007619dde7").unwrap(),
             },
         });
 
-        let encoded = request.clone().encode();
-        let decoded = Message::decode(&encoded).unwrap();
-
-        assert_eq!(request, decoded);
-    }
-
-    /*
-     * These RPC messages are not in use yet
-     *
-    #[test]
-    fn ref_test_encode_request_ticket() {
-        // reference input
-        let id = 1;
-        let hash_bytes =
-            hex::decode("fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736")
-                .unwrap();
-
         // expected hex output
         let expected_output =
-            hex::decode("05e201a0fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736")
+            hex::decode("05e28871ecff421fbfdd5683757470940100a028839e1549000003ef001000007619dde7")
                 .unwrap();
+        dbg!(hex::encode(message.clone().encode()));
 
-        let mut topic_hash = [0; 32];
-        topic_hash.copy_from_slice(&hash_bytes);
-
-        let message = Message::Request(Request {
-            id,
-            body: RequestBody::Ticket { topic: topic_hash },
-        });
-        assert_eq!(message.encode(), expected_output);
+        let encoded_message = message.clone().encode();
+        assert_eq!(encoded_message.clone(), expected_output);
+        assert_eq!(Message::decode(&encoded_message).unwrap(), message);
     }
 
     #[test]
-    fn ref_test_encode_request_register_topic() {
+    fn test_encode_request_talk_response() {
         // reference input
-        let id = 1;
-        let ticket =
-            hex::decode("fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736")
-                .unwrap();
-
-        // expected hex output
-        let expected_output =
-            hex::decode("07e201a0fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736")
-                .unwrap();
-
-        let message = Message::Request(Request {
-            id,
-            body: RequestBody::RegisterTopic { ticket },
-        });
-        assert_eq!(message.encode(), expected_output);
-    }
-
-    #[test]
-    fn ref_test_encode_request_topic_query() {
-        // reference input
-        let id = 1;
-        let hash_bytes =
-            hex::decode("fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736")
-                .unwrap();
-
-        // expected hex output
-        let expected_output =
-            hex::decode("09e201a0fb757dc581730490a1d7a00deea65e9b1936924caaea8f44d476014856b68736")
-                .unwrap();
-
-        let mut topic_hash = [0; 32];
-        topic_hash.copy_from_slice(&hash_bytes);
-
-        let message = Message::Request(Request {
-            id,
-            body: RequestBody::TopicQuery { topic: topic_hash },
-        });
-        assert_eq!(message.encode(), expected_output);
-    }
-
-    #[test]
-    fn ref_test_encode_response_register_topic() {
-        // reference input
-        let id = 1;
-        let registered = true;
-
-        // expected hex output
-        let expected_output = hex::decode("08c20101").unwrap();
+        let id = RequestId(vec![113, 236, 255, 66, 31, 191, 221, 86]);
         let message = Message::Response(Response {
             id,
-            body: ResponseBody::RegisterTopic { registered },
-        });
-        assert_eq!(message.encode(), expected_output);
-    }
-
-    #[test]
-    fn encode_decode_register_topic_request() {
-        let request = Message::Request(Request {
-            id: 1,
-            body: RequestBody::RegisterTopic {
-                topic: vec![1,2,3],
-                ticket: vec![1, 2, 3, 4, 5],
+            body: ResponseBody::Talk {
+                response: hex::decode("0100a028839e1549000003ef001000007619dde7").unwrap(),
             },
         });
-
-        let encoded = request.clone().encode();
-        let decoded = Message::decode(encoded).unwrap();
-
-        assert_eq!(request, decoded);
-    }
-
-    #[test]
-    fn encode_decode_register_topic_response() {
-        let request = Message::Response(Response {
-            id: 0,
-            body: ResponseBody::RegisterTopic { registered: true },
-        });
-
-        let encoded = request.clone().encode();
-        let decoded = Message::decode(encoded).unwrap();
-
-        assert_eq!(request, decoded);
-    }
-
-    #[test]
-    fn encode_decode_topic_query_request() {
-        let request = Message::Request(Request {
-            id: 1,
-            body: RequestBody::TopicQuery { topic: [17u8; 32] },
-        });
-
-        let encoded = request.clone().encode();
-        let decoded = Message::decode(encoded).unwrap();
-
-        assert_eq!(request, decoded);
-    }
-
-    #[test]
-    fn ref_test_encode_response_ticket() {
-        // reference input
-        let id = 1;
-        let ticket = [0; 32].to_vec(); // all 0's
-        let wait_time = 5;
 
         // expected hex output
-        let expected_output = hex::decode(
-            "06e301a0000000000000000000000000000000000000000000000000000000000000000005",
-        )
-        .unwrap();
+        let expected_output =
+            hex::decode("06de8871ecff421fbfdd56940100a028839e1549000003ef001000007619dde7")
+                .unwrap();
 
-        let message = Message::Response(Response {
-            id,
-            body: ResponseBody::Ticket { ticket, wait_time },
-        });
-        assert_eq!(message.encode(), expected_output);
+        dbg!(hex::encode(message.clone().encode()));
+
+        let encoded_message = message.clone().encode();
+        assert_eq!(encoded_message.clone(), expected_output);
+        assert_eq!(Message::decode(&encoded_message).unwrap(), message);
     }
 
     #[test]
-    fn encode_decode_ticket_response() {
-        let request = Message::Response(Response {
-            id: 0,
-            body: ResponseBody::Ticket {
-                ticket: vec![1, 2, 3, 4, 5],
-                wait_time: 5,
-            },
+    fn reject_oversized_request_id() {
+        // A PING request with a 9-byte request ID should be rejected.
+        // The discv5 spec limits request IDs to a maximum of 8 bytes.
+        let id = RequestId(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]); // 9 bytes
+        let request = Request {
+            id,
+            body: RequestBody::Ping { enr_seq: 1 },
+        };
+        let encoded = request.encode();
+        Message::decode(&encoded).expect_err("should reject request ID longer than 8 bytes");
+
+        // An 8-byte request ID should be accepted.
+        let id = RequestId(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let request = Message::Request(Request {
+            id,
+            body: RequestBody::Ping { enr_seq: 1 },
         });
-
         let encoded = request.clone().encode();
-        let decoded = Message::decode(encoded).unwrap();
-
+        let decoded = Message::decode(&encoded).expect("8-byte request ID should be valid");
         assert_eq!(request, decoded);
     }
 
-    */
+    #[test]
+    fn test_large_enr_hex_data() {
+        // This is the exact hex data from the logs that was failing to decode
+        let hex_data = "04f9012b88000000000000000001f9011ef9011bb840f986dbbaaf794e76c2dcd945e01686a6566409b4cf6ab2690fcdd347e958d35c2846bf61a001486623b6c805525e73a534212d313021c29b02bd0d85e799b8b9820162876174746e657473880080010000000000836367630986636c69656e74d18a4c69676874686f75736585372e312e30846574683290ce852d7070202361ffffffffffffffff8269648276348269708492be185a83697036902a03b0c0000200f000000000ca96f001836e666484ce852d70847175696382232985717569633682232989736563703235366b31a102463c7e28da88f61941e66ae44dd6d38a27f107ca2106158746b7d7f47eb765278873796e636e6574730f837463708223288474637036822328837564708223288475647036822328";
+
+        let data = hex::decode(hex_data).expect("Valid hex data");
+
+        // This should fail to decode with the current (original) logic
+        Message::decode(&data).expect("This should be decodable");
+    }
 }

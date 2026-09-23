@@ -33,14 +33,11 @@
 //! Pending entries are inserted lazily when their timeout is found to be expired
 //! upon querying the `KBucketsTable`. When that happens, the `KBucketsTable` records
 //! an [`AppliedPending`] result which must be consumed by calling [`take_applied_pending`]
-//! regularly and / or after performing lookup operations like [`entry`] and [`closest`].
+//! regularly and / or after performing lookup operations like [`entry`] and [`closest_keys`].
 //!
-//! [`entry`]: kbucket::KBucketsTable::entry
-//! [`closest`]: kbucket::KBucketsTable::closest
-//! [`AppliedPending`]: kbucket::AppliedPending
-//! [`KBucketsTable`]: kbucket::KBucketsTable
-//! [`take_applied_pending`]: kbucket::KBucketsTable::take_applied_pending
-//! [`PendingEntry`]: kbucket::PendingEntry
+//! [`entry`]: KBucketsTable::entry
+//! [`closest_keys`]: KBucketsTable::closest_keys
+//! [`take_applied_pending`]: KBucketsTable::take_applied_pending
 
 // [Implementation Notes]
 //
@@ -72,7 +69,7 @@
 
 mod bucket;
 mod entry;
-mod filter;
+pub(crate) mod filter;
 mod key;
 
 pub use entry::*;
@@ -81,10 +78,10 @@ pub use crate::handler::ConnectionDirection;
 use arrayvec::{self, ArrayVec};
 use bucket::KBucket;
 pub use bucket::{
-    ConnectionState, FailureReason, InsertResult as BucketInsertResult, UpdateResult,
-    MAX_NODES_PER_BUCKET,
+    ConnectionState, FailureReason, InsertResult as BucketInsertResult, MAX_NODES_PER_BUCKET,
+    UpdateResult,
 };
-pub use filter::{Filter, IpBucketFilter, IpTableFilter};
+use filter::Filter;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -107,42 +104,42 @@ impl<TNodeId, TVal> AsRef<Key<TNodeId>> for ClosestValue<TNodeId, TVal> {
 
 /// A key that can be returned from the `closest_keys` function, which indicates if the key matches the
 /// predicate or not.
-pub struct PredicateKey<TNodeId: Clone> {
+pub struct PredicateKey<TNodeId> {
     pub key: Key<TNodeId>,
     pub predicate_match: bool,
 }
 
-impl<TNodeId: Clone> From<PredicateKey<TNodeId>> for Key<TNodeId> {
+impl<TNodeId> From<PredicateKey<TNodeId>> for Key<TNodeId> {
     fn from(key: PredicateKey<TNodeId>) -> Self {
         key.key
     }
 }
 
-impl<TNodeId: Clone, TVal> From<PredicateValue<TNodeId, TVal>> for PredicateKey<TNodeId> {
-    fn from(value: PredicateValue<TNodeId, TVal>) -> Self {
-        PredicateKey {
-            key: value.key,
-            predicate_match: value.predicate_match,
-        }
-    }
-}
-
 /// A value being returned from a predicate closest iterator.
-pub struct PredicateValue<TNodeId: Clone, TVal> {
+pub struct PredicateValue<TNodeId, TVal> {
     pub key: Key<TNodeId>,
     pub predicate_match: bool,
     pub value: TVal,
 }
 
-impl<TNodeId: Clone, TVal> AsRef<Key<TNodeId>> for PredicateValue<TNodeId, TVal> {
+impl<TNodeId, TVal> AsRef<Key<TNodeId>> for PredicateValue<TNodeId, TVal> {
     fn as_ref(&self) -> &Key<TNodeId> {
         &self.key
     }
 }
 
-impl<TNodeId: Clone, TVal> From<PredicateValue<TNodeId, TVal>> for Key<TNodeId> {
-    fn from(key: PredicateValue<TNodeId, TVal>) -> Self {
-        key.key
+impl<TNodeId, TVal> PredicateValue<TNodeId, TVal> {
+    pub fn to_key_value(self) -> (PredicateKey<TNodeId>, TVal) {
+        let PredicateValue {
+            key,
+            predicate_match,
+            value,
+        } = self;
+        let key = PredicateKey {
+            key,
+            predicate_match,
+        };
+        (key, value)
     }
 }
 
@@ -172,7 +169,7 @@ pub enum InsertResult<TNodeId> {
         /// disconnected and whose corresponding peer should be checked for connectivity
         /// in order to prevent it from being evicted. If connectivity to the peer is
         /// re-established, the corresponding entry should be updated with
-        /// [`NodeStatus::Connected`].
+        /// [`bucket::ConnectionState::Connected`].
         disconnected: Key<TNodeId>,
     },
     /// The node existed and the status was updated.
@@ -294,7 +291,7 @@ where
                 let index = BucketIndex::new(&self.local_key.distance(key));
                 if let Some(i) = index {
                     let bucket = &mut self.buckets[i.get()];
-                    if let Some(node) = bucket.get(&key) {
+                    if let Some(node) = bucket.get(key) {
                         node.value == value
                     } else {
                         false
@@ -365,7 +362,7 @@ where
                 let index = BucketIndex::new(&self.local_key.distance(key));
                 if let Some(i) = index {
                     let bucket = &mut self.buckets[i.get()];
-                    if let Some(node) = bucket.get(&key) {
+                    if let Some(node) = bucket.get(key) {
                         node.value == value
                     } else {
                         false
@@ -426,18 +423,16 @@ where
                 let update_value = bucket.update_value(key, value);
 
                 match (update_value, update_status) {
-                    (UpdateResult::Updated { .. }, UpdateResult::Updated) => {
-                        InsertResult::Updated {
-                            promoted_to_connected: false,
-                        }
-                    }
-                    (UpdateResult::Updated { .. }, UpdateResult::UpdatedAndPromoted) => {
+                    (UpdateResult::Updated, UpdateResult::Updated) => InsertResult::Updated {
+                        promoted_to_connected: false,
+                    },
+                    (UpdateResult::Updated, UpdateResult::UpdatedAndPromoted) => {
                         InsertResult::Updated {
                             promoted_to_connected: true,
                         }
                     }
-                    (UpdateResult::Updated { .. }, UpdateResult::NotModified)
-                    | (UpdateResult::Updated { .. }, UpdateResult::UpdatedPending) => {
+                    (UpdateResult::Updated, UpdateResult::NotModified)
+                    | (UpdateResult::Updated, UpdateResult::UpdatedPending) => {
                         InsertResult::ValueUpdated
                     }
                     (UpdateResult::NotModified, UpdateResult::Updated) => {
@@ -519,6 +514,11 @@ where
         })
     }
 
+    /// Returns an iterator over all the buckets in the routing table
+    pub fn buckets_iter(&self) -> impl Iterator<Item = &KBucket<TNodeId, TVal>> {
+        self.buckets.iter()
+    }
+
     /// Returns an iterator over all the entries in the routing table to give to a table filter.
     ///
     /// This differs from the regular iterator as it doesn't take ownership of self and doesn't try
@@ -531,7 +531,7 @@ where
 
     /// Returns an iterator over all the entries in the routing table.
     /// Does not add pending node to kbucket to get an iterator which
-    /// takes a reference instead of a mutable reference.
+    /// takes a mutable reference instead of a reference.
     pub fn iter_ref(&self) -> impl Iterator<Item = EntryRefView<'_, TNodeId, TVal>> {
         self.buckets.iter().flat_map(move |table| {
             table.iter().map(move |n| EntryRefView {
@@ -563,25 +563,40 @@ where
     /// Returns an iterator over the keys that are contained in a kbucket, specified by a log2 distance.
     pub fn nodes_by_distances(
         &mut self,
-        log2_distances: Vec<u64>,
+        log2_distances: &[u64],
         max_nodes: usize,
     ) -> Vec<EntryRefView<'_, TNodeId, TVal>> {
+        // Filter log2 distances to only include those in the closed interval [1, 256]
         let distances = log2_distances
-            .into_iter()
-            .filter(|&d| d > 0 && d <= (NUM_BUCKETS as u64))
+            .iter()
+            .filter_map(|&d| {
+                if d > 0 && d <= (NUM_BUCKETS as u64) {
+                    Some(d)
+                } else {
+                    None
+                }
+            })
             .collect::<Vec<_>>();
 
-        // apply bending nodes
+        // Apply pending nodes
+        let mut node_count = 0;
         for distance in &distances {
-            // the log2 distance ranges from 1-256 and is always 1 more than the bucket index. For this
+            // The log2 distance ranges from 1-256 and is always 1 more than the bucket index. For this
             // reason we subtract 1 from log2 distance to get the correct bucket index.
             let bucket = &mut self.buckets[(distance - 1) as usize];
             if let Some(applied) = bucket.apply_pending() {
-                self.applied_pending.push_back(applied)
+                self.applied_pending.push_back(applied);
+                // Break if we've reached the maximum number of nodes we will provide in the
+                // response. There's no need to apply pending buckets past this point, the nodes
+                // in those buckets won't be part of the response.
+                node_count += bucket.num_entries();
+                if node_count >= max_nodes {
+                    break;
+                }
             }
         }
 
-        // find the matching nodes
+        // Find the matching nodes
         let mut matching_nodes = Vec::new();
 
         // Note we search via distance in order
@@ -686,14 +701,20 @@ where
     }
 
     /// Returns a reference to a bucket given the key. Returns None if bucket does not exist.
-    pub fn get_bucket<'a>(&'a self, key: &Key<TNodeId>) -> Option<&'a KBucket<TNodeId, TVal>> {
+    pub fn get_bucket(&self, key: &Key<TNodeId>) -> Option<&KBucket<TNodeId, TVal>> {
         let index = BucketIndex::new(&self.local_key.distance(key));
         if let Some(i) = index {
             let bucket = &self.buckets[i.get()];
-            Some(&bucket)
+            Some(bucket)
         } else {
             None
         }
+    }
+
+    /// Returns a bucket index given the key. Returns None if bucket index does not exist.
+    pub fn get_index(&self, key: &Key<TNodeId>) -> Option<usize> {
+        let index = BucketIndex::new(&self.local_key.distance(key));
+        index.map(|i| i.get())
     }
 }
 
@@ -752,7 +773,7 @@ impl ClosestBucketsIter {
     fn new(distance: Distance) -> Self {
         let state = match BucketIndex::new(&distance) {
             Some(i) => ClosestBucketsIterState::Start(i),
-            None => ClosestBucketsIterState::Done,
+            None => ClosestBucketsIterState::Start(BucketIndex(0)),
         };
         Self { distance, state }
     }
@@ -829,21 +850,18 @@ where
                     None => self.iter = None,
                 },
                 None => {
-                    if let Some(i) = self.buckets_iter.next() {
-                        let bucket = &mut self.table.buckets[i.get()];
-                        if let Some(applied) = bucket.apply_pending() {
-                            self.table.applied_pending.push_back(applied)
-                        }
-                        let mut v = (self.fmap)(bucket);
-                        v.sort_by(|a, b| {
-                            self.target
-                                .distance(a.as_ref())
-                                .cmp(&self.target.distance(b.as_ref()))
-                        });
-                        self.iter = Some(v.into_iter());
-                    } else {
-                        return None;
+                    let i = self.buckets_iter.next()?;
+                    let bucket = &mut self.table.buckets[i.get()];
+                    if let Some(applied) = bucket.apply_pending() {
+                        self.table.applied_pending.push_back(applied)
                     }
+                    let mut v = (self.fmap)(bucket);
+                    v.sort_by(|a, b| {
+                        self.target
+                            .distance(a.as_ref())
+                            .cmp(&self.target.distance(b.as_ref()))
+                    });
+                    self.iter = Some(v.into_iter());
                 }
             }
         }
@@ -953,6 +971,35 @@ mod tests {
     }
 
     #[test]
+    fn closest_local() {
+        let local_key = Key::from(NodeId::random());
+        let mut table = KBucketsTable::<_, ()>::new(
+            local_key,
+            Duration::from_secs(5),
+            MAX_NODES_PER_BUCKET,
+            None,
+            None,
+        );
+        let mut count = 0;
+        loop {
+            if count == 100 {
+                break;
+            }
+            let key = Key::from(NodeId::random());
+            if let Entry::Absent(e) = table.entry(&key) {
+                match e.insert((), connected_state()) {
+                    BucketInsertResult::Inserted => count += 1,
+                    _ => continue,
+                }
+            } else {
+                panic!("entry exists")
+            }
+        }
+        let local_key = table.local_key.clone();
+        assert_eq!(table.closest_keys(&local_key).count(), count);
+    }
+
+    #[test]
     fn applied_pending() {
         let local_key = Key::from(NodeId::random());
         let mut table = KBucketsTable::<_, ()>::new(
@@ -998,7 +1045,7 @@ mod tests {
 
         // Expire the timeout for the pending entry on the full bucket.`
         let full_bucket = &mut table.buckets[full_bucket_index.unwrap().get()];
-        let elapsed = Instant::now() - Duration::from_secs(1);
+        let elapsed = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
         full_bucket.pending_mut().unwrap().set_ready_at(elapsed);
 
         match table.entry(&expected_applied.inserted) {

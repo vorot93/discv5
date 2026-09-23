@@ -1,6 +1,5 @@
-use crate::{kbucket::Key, rpc::RequestBody, Enr};
+use crate::{Enr, kbucket::Key, rpc::RequestBody};
 use enr::NodeId;
-use sha2::digest::generic_array::GenericArray;
 use smallvec::SmallVec;
 use tokio::sync::oneshot;
 
@@ -17,6 +16,7 @@ pub struct QueryInfo {
     pub callback: oneshot::Sender<Vec<Enr>>,
 
     /// The number of distances we request for each peer.
+    /// NOTE: This must not be larger than 127.
     pub distances_to_request: usize,
 }
 
@@ -29,25 +29,21 @@ pub enum QueryType {
 
 impl QueryInfo {
     /// Builds an RPC Request, given the QueryInfo
-    pub(crate) fn rpc_request(&self, peer: NodeId) -> Result<RequestBody, &'static str> {
-        let request = match self.query_type {
+    pub(crate) fn rpc_request(&self, peer: NodeId) -> RequestBody {
+        match self.query_type {
             QueryType::FindNode(node_id) => {
                 let distances = findnode_log2distance(node_id, peer, self.distances_to_request)
-                    .ok_or("Requested a node find itself")?;
+                    .unwrap_or_else(|| vec![0]);
                 RequestBody::FindNode { distances }
             }
-        };
-
-        Ok(request)
+        }
     }
 }
 
 impl crate::query_pool::TargetKey<NodeId> for QueryInfo {
     fn key(&self) -> Key<NodeId> {
         match self.query_type {
-            QueryType::FindNode(ref node_id) => {
-                Key::new_raw(*node_id, *GenericArray::from_slice(&node_id.raw()))
-            }
+            QueryType::FindNode(ref node_id) => Key::new_raw(*node_id, node_id.raw()),
         }
     }
 }
@@ -73,10 +69,10 @@ fn findnode_log2distance(target: NodeId, peer: NodeId, size: usize) -> Option<Ve
         if distance + difference <= 256 {
             result_list.push(distance + difference);
         }
-        if result_list.len() < size {
-            if let Some(d) = distance.checked_sub(difference) {
-                result_list.push(d);
-            }
+        if result_list.len() < size
+            && let Some(d) = distance.checked_sub(difference)
+        {
+            result_list.push(d);
         }
         difference += 1;
     }

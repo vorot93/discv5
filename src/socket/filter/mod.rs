@@ -3,9 +3,9 @@
 use crate::{discv5::PERMIT_BAN_LIST, metrics::METRICS, node_info::NodeAddress, packet::Packet};
 use cache::ReceivedPacketCache;
 use enr::NodeId;
-use lru::LruCache;
+use hashlink::LruCache;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::atomic::Ordering,
     time::{Duration, Instant},
@@ -22,6 +22,7 @@ use rate_limiter::{LimitKind, RateLimiter};
 const KNOWN_ADDRS_SIZE: usize = 500;
 /// The number of IPs to retain at any given time that have banned nodes.
 const BANNED_NODES_SIZE: usize = 50;
+
 /// The maximum number of packets to keep record of for metrics if the rate limiter is not
 /// specified.
 const DEFAULT_PACKETS_PER_SECOND: usize = 20;
@@ -35,7 +36,7 @@ pub(crate) struct Filter {
     /// An ordered (by time) collection of recently seen packets by SocketAddr. The packet data is not
     /// stored here. This stores 5 seconds of history to calculate a 5 second moving average for
     /// the metrics.
-    raw_packets_received: ReceivedPacketCache<SocketAddr>,
+    raw_packets_received: ReceivedPacketCache,
     /// The duration that bans by this filter last.
     ban_duration: Option<Duration>,
     /// Keep track of node ids per socket. If someone is using too many node-ids per IP, they can
@@ -78,39 +79,24 @@ impl Filter {
     /// The first check. This determines if a new UDP packet should be decoded or dropped.
     /// Only unsolicited packets arrive here.
     pub fn initial_pass(&mut self, src: &SocketAddr) -> bool {
-        if PERMIT_BAN_LIST.read().permit_ips.get(&src.ip()).is_some() {
+        if PERMIT_BAN_LIST.read().permit_ips.contains(&src.ip()) {
             return true;
         }
 
-        if PERMIT_BAN_LIST.read().ban_ips.get(&src.ip()).is_some() {
-            debug!("Dropped unsolicited packet from banned src: {:?}", src);
+        if PERMIT_BAN_LIST.read().ban_ips.contains_key(&src.ip()) {
+            debug!(?src, "Dropped unsolicited packet from banned src");
             return false;
         }
 
         // Add the un-solicited request to the cache
         // If this is over the maximum requests per ENFORCED_SIZE_TIME, it will not be added, we
         // leave the rate limiter to enforce the rate limits..
-        let _ = self.raw_packets_received.cache_insert(*src);
+        self.raw_packets_received.cache_insert();
 
         // build the metrics
         METRICS
             .unsolicited_requests_per_window
             .store(self.raw_packets_received.len(), Ordering::Relaxed);
-
-        // It might not be worth the effort keeping an average for the metrics in the cache.
-        // Builds the hashmap of IPs to requests
-        let hashmap = {
-            let mut hashmap = HashMap::with_capacity(10);
-            for ip in self
-                .raw_packets_received
-                .iter()
-                .map(|packet| packet.content.ip())
-            {
-                *hashmap.entry(ip).or_default() += 1.0 / (METRICS.moving_window as f64);
-            }
-            hashmap
-        };
-        *METRICS.requests_per_ip_per_second.write() = hashmap;
 
         // If the filter isn't enabled, pass the packet
         if !self.enabled {
@@ -120,7 +106,7 @@ impl Filter {
         // Check rate limits
         if let Some(rate_limiter) = self.rate_limiter.as_mut() {
             if rate_limiter.allows(&LimitKind::Ip(src.ip())).is_err() {
-                warn!("Banning IP for excessive requests: {:?}", src.ip());
+                warn!(ip = ?src.ip(), "Banning IP for excessive requests");
                 // Ban the IP address
                 let ban_timeout = self.ban_duration.map(|v| Instant::now() + v);
                 PERMIT_BAN_LIST
@@ -131,7 +117,7 @@ impl Filter {
             }
 
             if rate_limiter.allows(&LimitKind::Total).is_err() {
-                debug!("Dropped unsolicited packet from RPC limit: {:?}", src.ip());
+                debug!(ip = ?src.ip(), "Dropped unsolicited packet from RPC limit");
                 return false;
             }
         }
@@ -142,8 +128,7 @@ impl Filter {
         if PERMIT_BAN_LIST
             .read()
             .permit_nodes
-            .get(&node_address.node_id)
-            .is_some()
+            .contains(&node_address.node_id)
         {
             return true;
         }
@@ -151,12 +136,11 @@ impl Filter {
         if PERMIT_BAN_LIST
             .read()
             .ban_nodes
-            .get(&node_address.node_id)
-            .is_some()
+            .contains_key(&node_address.node_id)
         {
             debug!(
-                "Dropped unsolicited packet from banned node_id: {}",
-                node_address
+                node = %node_address,
+                "Dropped unsolicited packet from banned node_id",
             );
             return false;
         }
@@ -166,39 +150,38 @@ impl Filter {
             return true;
         }
 
-        if let Some(rate_limiter) = self.rate_limiter.as_mut() {
-            if rate_limiter
+        if let Some(rate_limiter) = self.rate_limiter.as_mut()
+            && rate_limiter
                 .allows(&LimitKind::NodeId(node_address.node_id))
                 .is_err()
-            {
-                warn!(
-                    "Node has exceeded its request limit and is now banned {}",
-                    node_address.node_id
-                );
+        {
+            warn!(
+                node_id = %node_address.node_id,
+                "Node has exceeded its request limit and is now banned",
+            );
 
-                // The node is being banned
-                let ban_timeout = self.ban_duration.map(|v| Instant::now() + v);
-                PERMIT_BAN_LIST
-                    .write()
-                    .ban_nodes
-                    .insert(node_address.node_id, ban_timeout);
+            // The node is being banned
+            let ban_timeout = self.ban_duration.map(|v| Instant::now() + v);
+            PERMIT_BAN_LIST
+                .write()
+                .ban_nodes
+                .insert(node_address.node_id, ban_timeout);
 
-                // If we are tracking banned nodes per IP, add to the count. If the count is higher
-                // than our tolerance, ban the IP.
-                if let Some(max_bans_per_ip) = self.max_bans_per_ip {
-                    let ip = node_address.socket_addr.ip();
-                    if let Some(banned_count) = self.banned_nodes.get_mut(&ip) {
-                        *banned_count += 1;
-                        if *banned_count >= max_bans_per_ip {
-                            PERMIT_BAN_LIST.write().ban_ips.insert(ip, ban_timeout);
-                        }
-                    } else {
-                        self.banned_nodes.put(ip, 0);
+            // If we are tracking banned nodes per IP, add to the count. If the count is higher
+            // than our tolerance, ban the IP.
+            if let Some(max_bans_per_ip) = self.max_bans_per_ip {
+                let ip = node_address.socket_addr.ip();
+                if let Some(banned_count) = self.banned_nodes.get_mut(&ip) {
+                    *banned_count += 1;
+                    if *banned_count >= max_bans_per_ip {
+                        PERMIT_BAN_LIST.write().ban_ips.insert(ip, ban_timeout);
                     }
+                } else {
+                    self.banned_nodes.insert(ip, 0);
                 }
-
-                return false;
             }
+
+            return false;
         }
 
         // Check the nodes per IP filter configuration
@@ -212,17 +195,17 @@ impl Filter {
                 } else {
                     let mut ids = HashSet::new();
                     ids.insert(node_address.node_id);
-                    self.known_addrs.put(ip, ids);
+                    self.known_addrs.insert(ip, ids);
                     1
                 }
             };
 
             if known_nodes >= max_nodes_per_ip {
-                warn!("IP has exceeded its node-id limit and is now banned {}", ip);
+                warn!(%ip, "IP has exceeded its node-id limit and is now banned");
                 // The node is being banned
                 let ban_timeout = self.ban_duration.map(|v| Instant::now() + v);
                 PERMIT_BAN_LIST.write().ban_ips.insert(ip, ban_timeout);
-                self.known_addrs.pop(&ip);
+                self.known_addrs.remove(&ip);
                 return false;
             }
         }
